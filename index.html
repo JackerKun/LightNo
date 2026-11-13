@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no"
+    />
+    <meta name="theme-color" content="#05060a" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="LIGHTNO 移动测光表 — 点测光、区域框选、平均测光、高光/暗部优先、ND 补偿、带参数照片的测光日志，离线可用。"
+    />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="LIGHTNO" />
+    <title>LIGHTNO · 移动测光表</title>
+
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./assets/icons/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./assets/icons/icon-180.png" />
+    <link rel="stylesheet" href="./css/theme.css" />
+    <link rel="stylesheet" href="./css/layout.css" />
+    <link rel="stylesheet" href="./css/components.css" />
+  </head>
+  <body>
+    <div class="app" id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true">
+            <span class="brand__ring"></span>
+            <span class="brand__dot"></span>
+          </span>
+          <span class="brand__name">LIGHTNO</span>
+          <span class="brand__tag">METER</span>
+        </div>
+        <div class="topbar__actions">
+          <button class="chip chip--status" id="statusChip" type="button" data-source="init" aria-live="polite">
+            <span class="chip__dot"></span>
+            <span id="statusText">启动中</span>
+          </button>
+          <button class="icon-btn" id="btnLock" type="button" aria-pressed="false" aria-label="锁定测光">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+              <rect x="5" y="10.5" width="14" height="9.5" rx="2.2" />
+              <path d="M8.2 10.5V8a3.8 3.8 0 017.6 0v2.5" stroke-linecap="round" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <main class="viewport" id="viewport">
+        <!-- ================= 测光 ================= -->
+        <section class="view view--meter" id="view-meter" data-view="meter">
+          <div class="stage" id="stage">
+            <video class="stage__video" id="camera" playsinline autoplay muted></video>
+            <canvas class="stage__zebra" id="zebra" width="80" height="107" aria-hidden="true"></canvas>
+            <div class="stage__grid" id="grid" hidden aria-hidden="true"></div>
+            <div class="stage__vignette" aria-hidden="true"></div>
+
+            <div class="zone" id="zone" hidden aria-hidden="true">
+              <div class="zone__frame">
+                <span class="zone__corner zone__corner--tl"></span>
+                <span class="zone__corner zone__corner--tr"></span>
+                <span class="zone__corner zone__corner--bl"></span>
+                <span class="zone__corner zone__corner--br"></span>
+              </div>
+              <span class="zone__label" id="zoneLabel">SPOT</span>
+              <span class="zone__grip" id="zoneGrip" data-handle="size"></span>
+            </div>
+
+            <div class="stage__hud stage__hud--top">
+              <div class="hud-tags">
+                <span class="tag tag--mode" id="tagMode">SPOT</span>
+                <span class="tag" id="tagZoom" hidden>1.0×</span>
+                <span class="tag tag--lock" id="tagLock" hidden>LOCK</span>
+                <span class="tag tag--demo" id="tagDemo" hidden>DEMO</span>
+              </div>
+              <canvas class="hist" id="histogram" width="128" height="46" aria-hidden="true"></canvas>
+            </div>
+
+            <div class="stage__hud stage__hud--bottom">
+              <div class="hud-sub" id="hudHint">拖动测光框 · 双指缩放</div>
+            </div>
+
+            <button class="shutter" id="btnCapture" type="button" aria-label="保存测光照片与参数">
+              <span class="shutter__halo" aria-hidden="true"></span>
+              <span class="shutter__core">
+                <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7">
+                  <circle cx="12" cy="12" r="9.2" />
+                  <circle cx="12" cy="12" r="3.4" />
+                  <path d="M12 2.8v3.6M12 17.6v3.6M2.8 12h3.6M17.6 12h3.6" stroke-linecap="round" />
+                </svg>
+              </span>
+              <span class="shutter__label">保存</span>
+            </button>
+
+            <div class="zoom" id="zoomRail">
+              <span class="zoom__max" id="zoomMax">8×</span>
+              <input
+                class="zoom__input"
+                id="zoomInput"
+                type="range"
+                min="1"
+                max="8"
+                step="0.1"
+                value="1"
+                aria-label="变焦"
+              />
+              <span class="zoom__value" id="zoomValue">1.0×</span>
+            </div>
+
+            <div class="stage__fallback" id="stageFallback" hidden>
+              <div class="fallback">
+                <div class="fallback__icon">⌁</div>
+                <h3 id="fallbackTitle">相机未启动</h3>
+                <p id="fallbackMsg">需要允许摄像头权限才能测光。</p>
+                <div class="fallback__actions">
+                  <button class="btn btn--primary" id="btnRetryCam" type="button">重试相机</button>
+                  <button class="btn btn--ghost" id="btnDemo" type="button">进入演示模式</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel panel--readout">
+            <div class="readout">
+              <div class="ev">
+                <span class="ev__key">EV<sub>100</sub></span>
+                <div class="ev__line">
+                  <span class="ev__value" id="evValue">--.-</span>
+                  <span class="ev__unit">EV</span>
+                </div>
+                <span class="ev__sub" id="evSub">正在启动相机…</span>
+              </div>
+              <div class="metrics">
+                <div class="metric"><span>亮度</span><b id="metricLum">—</b></div>
+                <div class="metric"><span>反差</span><b id="metricDr">—</b></div>
+                <div class="metric"><span>色温</span><b id="metricCct">—</b></div>
+                <div class="metric"><span>区域</span><b id="metricZone">—</b></div>
+              </div>
+            </div>
+
+            <div class="exposures" id="exposures">
+              <div class="exposure" data-dial="iso">
+                <button
+                  class="exposure__main"
+                  id="cellIso"
+                  type="button"
+                  aria-label="ISO 感光度：上下滚动调整，点按选择"
+                  title="上下滚动 / 滑动调整"
+                >
+                  <span class="exposure__key">ISO</span>
+                  <b class="exposure__value" id="valIso">100</b>
+                  <i class="exposure__note" id="valIsoNote">手动设定</i>
+                </button>
+              </div>
+              <div class="exposure" data-dial="aperture">
+                <button
+                  class="exposure__main"
+                  id="cellAperture"
+                  type="button"
+                  aria-label="光圈：上下滚动调整，点按选择"
+                  title="上下滚动 / 滑动调整"
+                >
+                  <span class="exposure__key"
+                    >光圈 <i class="exposure__auto" id="autoAperture" hidden>AUTO</i></span
+                  >
+                  <b class="exposure__value" id="valAperture">f/8</b>
+                  <i class="exposure__note" id="valApertureNote">手动设定</i>
+                </button>
+              </div>
+              <div class="exposure exposure--shutter" data-dial="shutter">
+                <button
+                  class="exposure__main"
+                  id="cellShutter"
+                  type="button"
+                  aria-label="快门：上下滚动调整，点按选择"
+                  title="上下滚动 / 滑动调整"
+                >
+                  <span class="exposure__key"
+                    >快门 <i class="exposure__auto" id="autoShutter" hidden>AUTO</i></span
+                  >
+                  <b class="exposure__value" id="valShutter">—</b>
+                  <i class="exposure__note" id="valShutterNote">等待读数</i>
+                </button>
+              </div>
+              <div class="exposure exposure--nd" data-dial="nd">
+                <button
+                  class="exposure__main"
+                  id="cellNd"
+                  type="button"
+                  aria-label="ND 减光：上下滚动调整，点按选择"
+                  title="上下滚动 / 滑动调整"
+                >
+                  <span class="exposure__key">ND</span>
+                  <b class="exposure__value" id="valNd">OFF</b>
+                  <i class="exposure__note" id="valNdNote">无减光</i>
+                </button>
+              </div>
+            </div>
+
+            <div class="ladder" id="ladder" aria-label="等效曝光组合"></div>
+
+            <div class="modebar">
+              <div class="modes" id="modeRow" role="tablist" aria-label="测光模式">
+                <button class="mode is-active" type="button" data-mode="spot" role="tab">点测光</button>
+                <button class="mode" type="button" data-mode="area" role="tab">区域框选</button>
+                <button class="mode" type="button" data-mode="center" role="tab">中央重点</button>
+                <button class="mode" type="button" data-mode="average" role="tab">平均</button>
+                <button class="mode" type="button" data-mode="highlight" role="tab">高光优先</button>
+                <button class="mode" type="button" data-mode="shadow" role="tab">暗部优先</button>
+              </div>
+              <button class="icon-btn" id="btnMeterOptions" type="button" aria-label="测光选项">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7">
+                  <path d="M4 7h10M18 7h2M4 17h2M10 17h10" stroke-linecap="round" />
+                  <circle cx="16" cy="7" r="2.2" />
+                  <circle cx="8" cy="17" r="2.2" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================= 记录 ================= -->
+        <section class="view view--log" id="view-log" data-view="log" hidden>
+          <div class="view-head">
+            <div>
+              <h2>测光记录</h2>
+              <p class="view-head__sub" id="logSummary">0 条记录</p>
+            </div>
+            <div class="view-head__actions">
+              <button class="icon-btn" id="btnExport" type="button" aria-label="导出备份">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M12 4v11M8 11l4 4 4-4M4.5 19.5h15" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+              <button class="icon-btn" id="btnImport" type="button" aria-label="导入备份">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M12 16V5M8 9l4-4 4 4M4.5 19.5h15" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="filters" id="logFilters">
+            <button class="filter is-active" type="button" data-filter="all">全部</button>
+            <button class="filter" type="button" data-filter="today">今天</button>
+            <button class="filter" type="button" data-filter="week">本周</button>
+            <button class="filter" type="button" data-filter="favorite">收藏</button>
+          </div>
+
+          <div class="log-list" id="logList"></div>
+
+          <div class="empty" id="logEmpty">
+            <div class="empty__icon">◌</div>
+            <p class="empty__title">还没有测光记录</p>
+            <p class="empty__text">对准场景，点按取景框的保存键<br />照片与全部测光参数会写入本地日志</p>
+            <button class="btn btn--ghost" type="button" data-goto="meter">去测光</button>
+          </div>
+
+          <input type="file" id="importFile" accept="application/json,.json" hidden />
+        </section>
+
+        <!-- ================= 设置 ================= -->
+        <section class="view view--settings" id="view-settings" data-view="settings" hidden>
+          <div class="view-head">
+            <div>
+              <h2>设置</h2>
+              <p class="view-head__sub">测光引擎 · 显示 · 记录</p>
+            </div>
+          </div>
+
+          <div class="group">
+            <h3 class="group__title">测光引擎</h3>
+
+            <div class="setrow">
+              <div class="setrow__label"><b>数据来源</b><span id="capNote">检测中…</span></div>
+              <span class="badge" id="capBadge">—</span>
+            </div>
+
+            <button class="setrow setrow--btn" id="btnLens" type="button">
+              <span class="setrow__label"><b>镜头光圈</b><span>仅用于 EV 换算，手机主摄通常 f/1.8</span></span>
+              <span class="setrow__value" id="setLensValue">f/1.8</span>
+              <span class="setrow__chev">›</span>
+            </button>
+
+            <button class="setrow setrow--btn" id="btnCalibrate" type="button">
+              <span class="setrow__label"><b>校准偏移</b><span id="calibNote">建议用灰卡校准一次</span></span>
+              <span class="setrow__value" id="setCalibValue">0.0 EV</span>
+              <span class="setrow__chev">›</span>
+            </button>
+
+            <div class="setrow">
+              <div class="setrow__label"><b>采样频率</b><span>更高更灵敏，也更耗电</span></div>
+              <div class="seg" id="segFps">
+                <button type="button" data-value="6">节能</button>
+                <button type="button" data-value="10">标准</button>
+                <button type="button" data-value="15">高精度</button>
+              </div>
+            </div>
+
+            <button class="setrow setrow--btn" id="btnAnchor" type="button">
+              <span class="setrow__label"><b>相对测光锚点</b><span>设备不支持手动曝光时，作为场景 EV 基准</span></span>
+              <span class="setrow__value" id="setAnchorValue">EV 12.0</span>
+              <span class="setrow__chev">›</span>
+            </button>
+          </div>
+
+          <div class="group">
+            <h3 class="group__title">测光行为</h3>
+
+            <button class="setrow setrow--btn" id="btnTargetZone" type="button">
+              <span class="setrow__label"><b>点测光目标影调</b><span>Zone 系统，V = 18% 中灰</span></span>
+              <span class="setrow__value" id="setTargetZoneValue">ZONE V</span>
+              <span class="setrow__chev">›</span>
+            </button>
+
+            <div class="setrow setrow--stack">
+              <div class="setrow__label"><b>测光框尺寸</b><span id="setSpotSizeValue">14%</span></div>
+              <input type="range" id="rangeSpotSize" min="4" max="50" step="1" />
+            </div>
+
+            <div class="setrow setrow--stack">
+              <div class="setrow__label"><b>读数平滑</b><span>数值越小，读数越稳</span></div>
+              <input type="range" id="rangeSmoothing" min="5" max="100" step="5" />
+            </div>
+          </div>
+
+          <div class="group">
+            <h3 class="group__title">取景显示</h3>
+
+            <div class="setrow">
+              <div class="setrow__label"><b>直方图</b></div>
+              <button class="switch" id="swHistogram" type="button" role="switch" aria-label="直方图"></button>
+            </div>
+            <div class="setrow">
+              <div class="setrow__label"><b>高光溢出斑马纹</b><span>标出接近纯白的像素</span></div>
+              <button class="switch" id="swZebra" type="button" role="switch" aria-label="斑马纹"></button>
+            </div>
+            <div class="setrow">
+              <div class="setrow__label"><b>三分构图网格</b></div>
+              <button class="switch" id="swGrid" type="button" role="switch" aria-label="构图网格"></button>
+            </div>
+            <div class="setrow">
+              <div class="setrow__label"><b>屏幕常亮</b><span>测光时保持屏幕不熄灭</span></div>
+              <button class="switch" id="swWake" type="button" role="switch" aria-label="屏幕常亮"></button>
+            </div>
+          </div>
+
+          <div class="group">
+            <h3 class="group__title">记录与存储</h3>
+
+            <div class="setrow">
+              <div class="setrow__label"><b>写入地理位置</b><span>仅在保存时请求，数据留在本机</span></div>
+              <button class="switch" id="swGeotag" type="button" role="switch" aria-label="地理位置"></button>
+            </div>
+
+            <div class="setrow">
+              <div class="setrow__label"><b>照片质量</b><span id="qualityNote">标准 · 约 300KB / 张</span></div>
+              <div class="seg" id="segQuality">
+                <button type="button" data-value="0.82">标准</button>
+                <button type="button" data-value="0.92">高</button>
+              </div>
+            </div>
+
+            <div class="setrow">
+              <div class="setrow__label"><b>本地存储</b><span id="storageNote">—</span></div>
+              <button class="btn btn--tiny" id="btnClearShots" type="button">清空</button>
+            </div>
+          </div>
+
+          <div class="group">
+            <h3 class="group__title">关于</h3>
+
+            <div class="setrow">
+              <div class="setrow__label"><b>版本</b><span>LIGHTNO PWA</span></div>
+              <span class="setrow__value">1.0.0</span>
+            </div>
+
+            <button class="setrow setrow--btn" id="btnAlgorithm" type="button">
+              <span class="setrow__label"><b>测光算法说明</b><span>EV、ND、Zone 与校准原理</span></span>
+              <span class="setrow__chev">›</span>
+            </button>
+
+            <button class="setrow setrow--btn" id="btnInstall" type="button">
+              <span class="setrow__label"><b>安装到桌面</b><span id="installNote">离线可用，像 App 一样启动</span></span>
+              <span class="setrow__chev">›</span>
+            </button>
+
+            <button class="setrow setrow--btn setrow--danger" id="btnReset" type="button">
+              <span class="setrow__label"><b>恢复默认设置</b><span>不会删除测光记录</span></span>
+              <span class="setrow__chev">›</span>
+            </button>
+          </div>
+
+          <p class="footnote">
+            所有图像与读数仅保存在本机浏览器（IndexedDB），不会上传到任何服务器。
+          </p>
+        </section>
+      </main>
+
+      <nav class="tabbar" aria-label="主导航">
+        <button class="tab is-active" type="button" data-target="meter" aria-current="page">
+          <span class="tab__icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7">
+              <circle cx="12" cy="12" r="8.6" />
+              <circle cx="12" cy="12" r="3" />
+              <path d="M12 3.4v3M12 17.6v3M3.4 12h3M17.6 12h3" stroke-linecap="round" />
+            </svg>
+          </span>
+          <span class="tab__text">测光</span>
+        </button>
+
+        <button class="tab" type="button" data-target="log">
+          <span class="tab__icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7">
+              <rect x="3.6" y="5" width="16.8" height="14" rx="2.4" />
+              <path d="M7 9h6M7 12.5h10M7 16h8" stroke-linecap="round" />
+            </svg>
+            <i class="tab__badge" id="logBadge" hidden>0</i>
+          </span>
+          <span class="tab__text">记录</span>
+        </button>
+
+        <button class="tab" type="button" data-target="settings">
+          <span class="tab__icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7">
+              <path d="M4 7.5h9M17.5 7.5H20M4 16.5h2.5M11 16.5h9" stroke-linecap="round" />
+              <circle cx="15.2" cy="7.5" r="2.3" />
+              <circle cx="8.8" cy="16.5" r="2.3" />
+            </svg>
+          </span>
+          <span class="tab__text">设置</span>
+        </button>
+      </nav>
+    </div>
+
+    <script type="module" src="./js/main.js"></script>
+  </body>
+</html>
