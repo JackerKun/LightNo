@@ -139,6 +139,13 @@
   box-shadow: 0 0 16px rgba(55, 242, 255, 0.16);
 }
 
+.icon-btn.is-held {
+  color: var(--amber);
+  border-color: rgba(255, 199, 92, 0.45);
+  background: rgba(255, 199, 92, 0.1);
+  box-shadow: 0 0 16px rgba(255, 199, 92, 0.16);
+}
+
 .icon-btn:active {
   transform: scale(0.94);
 }
@@ -170,6 +177,17 @@
   color: var(--amber);
   border-color: rgba(255, 199, 92, 0.4);
   background: rgba(255, 199, 92, 0.1);
+  animation: hold-glow 2.4s ease-in-out infinite;
+}
+
+@keyframes hold-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 rgba(255, 199, 92, 0);
+  }
+  50% {
+    box-shadow: 0 0 14px rgba(255, 199, 92, 0.3);
+  }
 }
 
 .tag--demo {
@@ -197,6 +215,11 @@
   flex: 0 0 auto;
 }
 
+.panel--readout.is-held {
+  border-color: rgba(255, 199, 92, 0.34);
+  box-shadow: var(--shadow), 0 0 0 1px rgba(255, 199, 92, 0.12), 0 0 28px rgba(255, 199, 92, 0.08);
+}
+
 /* 读数 */
 .readout {
   display: flex;
@@ -210,6 +233,79 @@
   flex-direction: column;
   gap: 1px;
   min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 10px;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.12s ease;
+}
+
+.ev:active {
+  transform: scale(0.995);
+}
+
+.ev__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
+.ev__hold {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(55, 242, 255, 0.32);
+  background: rgba(55, 242, 255, 0.08);
+  color: var(--cyan);
+  font-family: var(--mono);
+  font-size: 7.5px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  transition: color 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.ev__hold svg {
+  flex: none;
+}
+
+.ev__hold i {
+  font-style: normal;
+}
+
+.ev:hover .ev__hold {
+  border-color: rgba(55, 242, 255, 0.55);
+}
+
+.ev.is-held .ev__hold {
+  color: var(--amber);
+  border-color: rgba(255, 199, 92, 0.55);
+  background: rgba(255, 199, 92, 0.12);
+  box-shadow: 0 0 12px rgba(255, 199, 92, 0.16);
+}
+
+.ev.is-held .ev__value {
+  background: linear-gradient(135deg, #fff6e2 8%, #ffc75c 55%, #ff9d5c 110%);
+  filter: drop-shadow(0 0 20px rgba(255, 199, 92, 0.28));
+}
+
+.ev__lockicon {
+  flex: none;
+  align-self: center;
+  color: var(--amber);
+  filter: drop-shadow(0 0 8px rgba(255, 199, 92, 0.5));
+}
+
+.ev.is-held .ev__sub {
+  color: rgba(255, 199, 92, 0.8);
 }
 
 .ev__key {

@@ -586,6 +586,13 @@ export function openOnboarding({ onDone } = {}) {
           <p>ISO、光圈、快门、ND 都支持上下滑动 / 鼠标滚轮，滑动时会显示相邻档位。调<b>光圈</b>进入光圈优先，测光自动改快门；调<b>快门</b>进入快门优先，测光自动改光圈。</p>
         </div>
       </div>
+      <div class="onboard__item">
+        <span class="onboard__num">06</span>
+        <div>
+          <b>HOLD 锁定读数</b>
+          <p>测完光点一下 <b>EV 数字</b>（或右上角锁 / 双击画面）即可 HOLD：读数、直方图、斑马纹都会冻结，移动手机去设置相机也不会变。点「解除」继续测光。</p>
+        </div>
+      </div>
     </div>
     <p class="picker-note" style="margin-top:14px">
       没有相机权限？可以在取景框的提示里进入演示模式，先熟悉界面与读数。

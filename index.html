@@ -74,7 +74,7 @@
               <div class="hud-tags">
                 <span class="tag tag--mode" id="tagMode">SPOT</span>
                 <span class="tag" id="tagZoom" hidden>1.0×</span>
-                <span class="tag tag--lock" id="tagLock" hidden>LOCK</span>
+                <span class="tag tag--lock" id="tagLock" hidden>HOLD</span>
                 <span class="tag tag--demo" id="tagDemo" hidden>DEMO</span>
               </div>
               <canvas class="hist" id="histogram" width="128" height="46" aria-hidden="true"></canvas>
@@ -124,16 +124,46 @@
             </div>
           </div>
 
-          <div class="panel panel--readout">
+          <div class="panel panel--readout" id="readoutPanel">
             <div class="readout">
-              <div class="ev">
-                <span class="ev__key">EV<sub>100</sub></span>
-                <div class="ev__line">
+              <button
+                class="ev"
+                id="evHold"
+                type="button"
+                aria-pressed="false"
+                aria-label="锁定测光读数"
+                title="锁定 / 解除当前读数"
+              >
+                <span class="ev__top">
+                  <span class="ev__key">EV<sub>100</sub></span>
+                  <span class="ev__hold" id="evHoldPill">
+                    <svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" stroke-width="2.2">
+                      <rect x="5" y="10.5" width="14" height="9.5" rx="2.2" />
+                      <path d="M8.2 10.5V8a3.8 3.8 0 017.6 0v2.5" stroke-linecap="round" />
+                    </svg>
+                    <i id="evHoldText">HOLD</i>
+                  </span>
+                </span>
+                <span class="ev__line">
                   <span class="ev__value" id="evValue">--.-</span>
                   <span class="ev__unit">EV</span>
-                </div>
+                  <svg
+                    class="ev__lockicon"
+                    id="evLockIcon"
+                    viewBox="0 0 24 24"
+                    width="15"
+                    height="15"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    hidden
+                  >
+                    <rect x="5" y="10.5" width="14" height="9.5" rx="2.2" />
+                    <path d="M8.2 10.5V8a3.8 3.8 0 017.6 0v2.5" stroke-linecap="round" />
+                  </svg>
+                </span>
                 <span class="ev__sub" id="evSub">正在启动相机…</span>
-              </div>
+              </button>
               <div class="metrics">
                 <div class="metric"><span>亮度</span><b id="metricLum">—</b></div>
                 <div class="metric"><span>反差</span><b id="metricDr">—</b></div>

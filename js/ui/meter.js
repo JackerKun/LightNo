@@ -82,6 +82,10 @@ const dom = {
   demoBtn: $('#btnDemo'),
   evValue: $('#evValue'),
   evSub: $('#evSub'),
+  evHold: $('#evHold'),
+  evHoldText: $('#evHoldText'),
+  evLockIcon: $('#evLockIcon'),
+  readoutPanel: $('#readoutPanel'),
   metricLum: $('#metricLum'),
   metricDr: $('#metricDr'),
   metricCct: $('#metricCct'),
@@ -171,6 +175,25 @@ function updateStatus() {
   setText(dom.statusText, sourceLabel(rt.source));
   dom.tagDemo.hidden = rt.source !== 'demo';
   dom.tagLock.hidden = !rt.locked;
+  syncHoldUI();
+}
+
+/** 同步 HOLD 视觉状态（EV 按钮 / 面板 / 顶栏锁 / 阶段标签） */
+function syncHoldUI() {
+  const locked = !!getRuntime().locked;
+  if (dom.evHold) {
+    dom.evHold.classList.toggle('is-held', locked);
+    dom.evHold.setAttribute('aria-pressed', String(locked));
+    dom.evHold.setAttribute('aria-label', locked ? '解除测光锁定' : '锁定测光读数');
+  }
+  if (dom.evHoldText) dom.evHoldText.textContent = locked ? '解除' : 'HOLD';
+  if (dom.evLockIcon) dom.evLockIcon.hidden = !locked;
+  if (dom.readoutPanel) dom.readoutPanel.classList.toggle('is-held', locked);
+  if (dom.btnLock) {
+    dom.btnLock.classList.toggle('is-held', locked);
+    dom.btnLock.setAttribute('aria-pressed', String(locked));
+    dom.btnLock.setAttribute('aria-label', locked ? '解除测光锁定' : '锁定测光');
+  }
 }
 
 function showCameraError(err) {
@@ -222,6 +245,15 @@ async function startCamera() {
     updateZoomRange();
     updateStatus();
     await applyZoom(getSettings().zoom);
+
+    if (getRuntime().locked && lockSnapshot && lockSnapshot.cameraExposure && camera.manual) {
+      try {
+        await camera.setExposure(lockSnapshot.cameraExposure);
+      } catch {
+        /* ignore */
+      }
+    }
+
     lastAe = 0;
 
     if (!result.manual) {
@@ -517,8 +549,10 @@ function onFrame(now) {
     currentZoneValue = measured.zoneValue;
   }
 
-  updateZebra(result, s);
-  drawHistogram(result, s);
+  if (!rt.locked) {
+    updateZebra(result, s);
+    drawHistogram(result, s);
+  }
   updateReadout();
   schedule();
 }
@@ -704,8 +738,11 @@ function updateReadout(force = false) {
 
   setText(dom.evValue, formatEv(ev, 1));
 
-  const lockText = locked ? ' · 已锁定' : '';
-  setText(dom.evSub, `${MODE_META[s.mode].label} · ${sourceLabel(rt.source)}${lockText}`);
+  if (locked) {
+    setText(dom.evSub, '已锁定 · 点按解除后重新测光');
+  } else {
+    setText(dom.evSub, `${MODE_META[s.mode].label} · ${sourceLabel(rt.source)}`);
+  }
 
   setText(dom.metricLum, formatLuminance(luminanceFromEv(ev)));
   dom.metricLum.classList.toggle('is-warn', data.frame.clip > 0.02);
@@ -758,7 +795,9 @@ function updateReadout(force = false) {
   setText(dom.valNdNote, nd > 0 ? `${ndDensity(nd)} 密度 · ${nd.toFixed(1)} 档` : '无减光');
 
   const clip = data.frame.clip;
-  if (clip > 0.03) {
+  if (locked) {
+    setText(dom.hudHint, 'HOLD · 移动手机不会改变读数');
+  } else if (clip > 0.03) {
     setText(dom.hudHint, `高光溢出 ${(clip * 100).toFixed(1)}% · 试试高光优先或降低相机曝光`);
   } else {
     setText(dom.hudHint, MODE_META[s.mode].hint + ' · 双指缩放');
@@ -795,18 +834,29 @@ function toggleLock() {
       toast('还没有有效读数', { type: 'warn', duration: 1800 });
       return;
     }
-    lockSnapshot = { ev: evSmooth, stats, zoneValue: currentZoneValue };
+    const ex = camera && camera.isActive ? camera.getExposure() : null;
+    lockSnapshot = {
+      ev: evSmooth,
+      stats,
+      zoneValue: currentZoneValue,
+      cameraExposure:
+        ex && Number.isFinite(ex.shutter) && Number.isFinite(ex.iso)
+          ? { shutter: ex.shutter, iso: ex.iso }
+          : null
+    };
   } else if (lockSnapshot) {
     evSmooth = lockSnapshot.ev;
     lockSnapshot = null;
+    lastAe = 0;
   }
   setRuntime({ locked: next });
-  dom.btnLock.setAttribute('aria-pressed', String(next));
   updateStatus();
   updateZone();
   updateReadout(true);
   hapticTap();
-  toast(next ? '测光已锁定 · 可以重新构图' : '已解除锁定', { duration: 1400 });
+  toast(next ? '已锁定读数 · 可以移动手机设置相机' : '已解除锁定 · 继续测光', {
+    duration: next ? 2600 : 1600
+  });
 }
 
 function handleZoneChange(patch) {
@@ -1305,6 +1355,7 @@ function initInteractions() {
   });
 
   dom.btnLock.addEventListener('click', toggleLock);
+  if (dom.evHold) dom.evHold.addEventListener('click', toggleLock);
 
   dom.modeRow.querySelectorAll('.mode').forEach((btn) => {
     btn.addEventListener('click', () => {
