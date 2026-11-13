@@ -100,6 +100,9 @@ const dom = {
   valShutterNote: $('#valShutterNote'),
   valNd: $('#valNd'),
   valNdNote: $('#valNdNote'),
+  dialWheel: $('#dialWheel'),
+  dialWheelLabel: $('#dialWheelLabel'),
+  dialWheelList: $('#dialWheelList'),
   ladder: $('#ladder'),
   modeRow: $('#modeRow'),
   btnOptions: $('#btnMeterOptions'),
@@ -957,6 +960,109 @@ function flashDial(dial) {
   dialFlashTimer = setTimeout(() => cell.classList.remove('is-stepping'), 180);
 }
 
+/* ------------------------------------------------------------------ *
+ * 拨盘浮层：滑动时显示当前值 + 上下相邻档位
+ * ------------------------------------------------------------------ */
+const DIAL_WHEEL_META = {
+  iso: { label: 'ISO', values: ISOS, format: (v) => String(v) },
+  aperture: { label: '光圈', values: APERTURES, format: (v) => 'f/' + v },
+  shutter: { label: '快门', values: SHUTTERS, format: (v) => formatShutter(v) },
+  nd: {
+    label: 'ND 减光',
+    values: ND_DIAL_STOPS,
+    format: (v) => (v === 0 ? 'OFF' : ndLabel(v))
+  }
+};
+
+let dialWheelHideTimer = null;
+let dialWheelAnimTimer = null;
+
+function currentDialValue(dial, s) {
+  if (dial === 'iso') return s.iso;
+  if (dial === 'nd') return s.ndStops;
+  const ev = currentEv();
+  const pair = Number.isFinite(ev) ? resolvePair(s, ev) : null;
+  if (dial === 'aperture') {
+    return s.priority === 'aperture' ? s.aperture : pair ? pair.aperture : s.aperture;
+  }
+  return s.priority === 'shutter' ? s.shutter : pair ? pair.shutter : s.shutter;
+}
+
+function hideDialWheel() {
+  if (!dom.dialWheel) return;
+  dom.dialWheel.classList.remove('is-open');
+  clearTimeout(dialWheelHideTimer);
+  dialWheelHideTimer = setTimeout(() => {
+    if (dom.dialWheel && !dom.dialWheel.classList.contains('is-open')) {
+      dom.dialWheel.hidden = true;
+    }
+  }, 200);
+}
+
+function showDialWheel(dial, direction = 0) {
+  const meta = DIAL_WHEEL_META[dial];
+  const cell = document.querySelector(`.exposure[data-dial="${dial}"]`);
+  if (!meta || !cell || !dom.dialWheel) return;
+
+  const s = getSettings();
+  const actual = currentDialValue(dial, s);
+  const list = meta.values;
+  let index = list.findIndex((v) => Math.abs(v - actual) < 1e-6);
+  if (index < 0) {
+    index = list.reduce(
+      (best, v, i) => (Math.abs(v - actual) < Math.abs(list[best] - actual) ? i : best),
+      0
+    );
+  }
+
+  const rows = [index - 2, index - 1, index, index + 1, index + 2];
+  const items = dom.dialWheelList.querySelectorAll('li');
+  items.forEach((li, i) => {
+    const row = rows[i];
+    const value = list[row];
+    const has = row >= 0 && row < list.length && value !== undefined;
+    li.textContent = has ? (i === 2 ? meta.format(actual) : meta.format(value)) : '';
+    li.classList.toggle('is-center', i === 2 && has);
+    li.classList.toggle('is-empty', !has);
+  });
+  dom.dialWheelLabel.textContent = meta.label;
+
+  dom.dialWheel.hidden = false;
+  const rect = cell.getBoundingClientRect();
+  const wheelRect = dom.dialWheel.getBoundingClientRect();
+  const width = wheelRect.width || 136;
+  const height = wheelRect.height || 150;
+  const margin = 10;
+
+  let left = rect.left + rect.width / 2;
+  left = clamp(left, margin + width / 2, window.innerWidth - margin - width / 2);
+
+  let above = true;
+  let top = rect.top - 10;
+  if (top - height < margin) {
+    above = false;
+    top = Math.min(window.innerHeight - margin - height, rect.bottom + 10);
+  }
+
+  dom.dialWheel.style.left = left + 'px';
+  dom.dialWheel.style.top = top + 'px';
+  dom.dialWheel.style.transform = above ? 'translate(-50%, -100%)' : 'translate(-50%, 0)';
+  dom.dialWheel.classList.toggle('is-below', !above);
+  dom.dialWheel.classList.add('is-open');
+
+  const listEl = dom.dialWheelList;
+  listEl.classList.remove('tick-up', 'tick-down');
+  if (direction) {
+    void listEl.offsetWidth;
+    listEl.classList.add(direction > 0 ? 'tick-up' : 'tick-down');
+  }
+  clearTimeout(dialWheelAnimTimer);
+  dialWheelAnimTimer = setTimeout(() => listEl.classList.remove('tick-up', 'tick-down'), 200);
+
+  clearTimeout(dialWheelHideTimer);
+  dialWheelHideTimer = setTimeout(hideDialWheel, 1600);
+}
+
 /**
  * 拨盘步进：
  * - ISO / ND 直接修改
@@ -991,10 +1097,12 @@ function dialStep(dial, dir) {
     }
   }
 
-  if (!patch) return;
-  updateSettings(patch);
-  hapticTap();
-  flashDial(dial);
+  if (patch) {
+    updateSettings(patch);
+    hapticTap();
+    flashDial(dial);
+  }
+  showDialWheel(dial, dir);
 }
 
 function bindDials() {
@@ -1092,6 +1200,9 @@ function bindDials() {
       if (cell) dialStep(cell.dataset.dial, event.key === 'ArrowUp' ? 1 : -1);
     });
   });
+
+  window.addEventListener('resize', hideDialWheel);
+  window.addEventListener('orientationchange', hideDialWheel);
 }
 
 function showEngineInfo() {
@@ -1211,10 +1322,12 @@ function initInteractions() {
   dom.btnOptions.addEventListener('click', () => openMeterOptions({ getEv: currentEv }));
 
   dom.cellIso.addEventListener('click', () => {
+    hideDialWheel();
     pickIso(getSettings().iso, (v) => updateSettings({ iso: v }));
   });
 
   dom.cellAperture.addEventListener('click', () => {
+    hideDialWheel();
     const s = getSettings();
     const ev = currentEv();
     const pair = Number.isFinite(ev) ? resolvePair(s, ev) : null;
@@ -1224,6 +1337,7 @@ function initInteractions() {
   });
 
   dom.cellShutter.addEventListener('click', () => {
+    hideDialWheel();
     const s = getSettings();
     const ev = currentEv();
     const pair = Number.isFinite(ev) ? resolvePair(s, ev) : null;
@@ -1233,6 +1347,7 @@ function initInteractions() {
   });
 
   dom.cellNd.addEventListener('click', () => {
+    hideDialWheel();
     pickNd(getSettings().ndStops, (v) => updateSettings({ ndStops: v }));
   });
 
@@ -1294,6 +1409,7 @@ export function createMeter({ onSaved, onNavigate } = {}) {
       running = false;
       cancelLoop();
       stopCamera();
+      hideDialWheel();
       syncWakeLock();
     },
     getLiveEv() {

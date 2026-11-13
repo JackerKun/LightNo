@@ -583,7 +583,7 @@ export function openOnboarding({ onDone } = {}) {
         <span class="onboard__num">05</span>
         <div>
           <b>上下滚动切换曝光</b>
-          <p>ISO、光圈、快门、ND 都支持上下滑动 / 鼠标滚轮。调<b>光圈</b>进入光圈优先，测光自动改快门；调<b>快门</b>进入快门优先，测光自动改光圈。</p>
+          <p>ISO、光圈、快门、ND 都支持上下滑动 / 鼠标滚轮，滑动时会显示相邻档位。调<b>光圈</b>进入光圈优先，测光自动改快门；调<b>快门</b>进入快门优先，测光自动改光圈。</p>
         </div>
       </div>
     </div>
