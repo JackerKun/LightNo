@@ -116,7 +116,11 @@ export function attachStageGestures(stage, opts) {
     if (isPositionable()) {
       if (zoneEl && zoneEl.contains(event.target)) {
         mode = 'drag';
-      } else if (!event.target.closest('.zoom') && !event.target.closest('.shutter')) {
+      } else if (
+        !event.target.closest('.zoom') &&
+        !event.target.closest('.shutter') &&
+        !event.target.closest('.stage-photo')
+      ) {
         // 点按空白处：立即把测光框移动过去后继续拖动
         applyCenter(event.clientX - rect.left, event.clientY - rect.top);
         mode = 'drag';

@@ -30,7 +30,10 @@ import { hapticTap } from './haptic.js';
 
 const SOURCE_LABELS = {
   hardware: '硬件测光',
-  relative: '相对测光',
+  auto: '自动测光',
+  image: '图像测光',
+  relative: '图像测光',
+  photo: '拍照测光',
   demo: '演示模式',
   error: '相机异常'
 };
@@ -173,6 +176,16 @@ function openDetail(shot) {
     ['校准偏移', `${shot.calibration >= 0 ? '+' : ''}${Number(shot.calibration || 0).toFixed(1)} EV`],
     ['时间', shot.timeLabel || '—']
   ];
+  if (shot.cameraExposure && shot.cameraExposure.source === 'exif') {
+    const ce = shot.cameraExposure;
+    rows.push([
+      '照片曝光',
+      `${formatShutter(ce.shutter)} · ${formatAperture(ce.aperture)} · ISO ${ce.iso}`
+    ]);
+    if (shot.photoMeta && shot.photoMeta.model) {
+      rows.push(['拍摄设备', shot.photoMeta.model]);
+    }
+  }
   if (shot.coords) rows.push(['坐标', shot.coords]);
 
   content.innerHTML = `

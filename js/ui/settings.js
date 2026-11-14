@@ -25,6 +25,7 @@ import {
 let getLiveEvFn = () => NaN;
 let onClearedCb = null;
 let onInstallCb = null;
+let onEngineChangeCb = null;
 
 function setSwitch(id, on) {
   const node = $(id);
@@ -50,10 +51,15 @@ function renderCapability() {
     badge.textContent = '手动曝光';
     badge.classList.add('is-ok');
     note.textContent = '已接管相机曝光，可输出绝对 EV';
-  } else if (rt.source === 'relative') {
-    badge.textContent = '相对测光';
-    badge.classList.add('is-warn');
-    note.textContent = '此浏览器不开放手动曝光，需设置锚点';
+  } else if (rt.source === 'auto') {
+    badge.textContent = '自动测光';
+    badge.classList.add('is-ok');
+    note.textContent = '读取相机自动曝光参数 + 图像分析，输出绝对 EV';
+  } else if (rt.source === 'image' || rt.source === 'relative') {
+    badge.textContent = '图像测光';
+    badge.classList.add('is-ok');
+    note.textContent =
+      '仅靠图像亮度分析；可用基准 EV / 校准，iPhone 也可用拍照测光读取 EXIF。设置里可切换硬件曝光（若支持）';
   } else if (rt.source === 'demo') {
     badge.textContent = '演示模式';
     badge.classList.add('is-demo');
@@ -110,6 +116,7 @@ function sync() {
 
   setSeg('#segFps', s.fps);
   setSeg('#segQuality', s.quality);
+  setSeg('#segEngine', s.engine);
 
   setText(
     $('#qualityNote'),
@@ -129,10 +136,16 @@ function wireSwitch(id, key) {
   });
 }
 
-export function createSettings({ getLiveEv, onCleared, onInstall } = {}) {
+export function createSettings({
+  getLiveEv,
+  onCleared,
+  onInstall,
+  onEngineChange
+} = {}) {
   getLiveEvFn = getLiveEv || (() => NaN);
   onClearedCb = onCleared || null;
   onInstallCb = onInstall || null;
+  onEngineChangeCb = onEngineChange || null;
 
   wireSwitch('#swHistogram', 'showHistogram');
   wireSwitch('#swZebra', 'showZebra');
@@ -173,6 +186,18 @@ export function createSettings({ getLiveEv, onCleared, onInstall } = {}) {
   if (lensBtn) {
     lensBtn.addEventListener('click', () => {
       pickLens(getSettings().lensAperture, (v) => updateSettings({ lensAperture: v }));
+    });
+  }
+
+  const engineSeg = $('#segEngine');
+  if (engineSeg) {
+    engineSeg.addEventListener('click', (event) => {
+      const btn = event.target.closest('button[data-value]');
+      if (!btn || getSettings().engine === btn.dataset.value) return;
+      updateSettings({ engine: btn.dataset.value });
+      sync();
+      hapticTap();
+      if (onEngineChangeCb) onEngineChangeCb(btn.dataset.value);
     });
   }
 

@@ -3,7 +3,7 @@
  *
  * 数据流：
  *   camera/video → FrameSampler（线性亮度）→ analyze（区域统计）
- *   → 求 EV（相机手动曝光 或 相对锚点）→ 平滑 → 读数 / 推荐曝光 / 记录
+ *   → 求 EV（相机曝光元数据 或 图像基准）→ 平滑 → 读数 / 推荐曝光 / 记录
  */
 import { $, setText, timeLabel, shortDate, uid } from './dom.js';
 import {
@@ -158,8 +158,11 @@ function sourceLabel(source) {
   switch (source) {
     case 'hardware':
       return '硬件测光';
+    case 'auto':
+      return '自动测光';
+    case 'image':
     case 'relative':
-      return '相对测光';
+      return '图像测光';
     case 'demo':
       return '演示模式';
     case 'error':
@@ -224,10 +227,12 @@ async function startCamera() {
   dom.fallback.hidden = true;
 
   try {
-    const result = await camera.start();
+    const result = await camera.start({ allowManual: getSettings().engine === 'hardware' });
     const caps = result.capabilities || {};
+    const ex = camera.getExposure();
+    const hasExposureMeta = Number.isFinite(ex.shutter) && Number.isFinite(ex.iso);
     setRuntime({
-      source: result.manual ? 'hardware' : 'relative',
+      source: result.manual ? 'hardware' : hasExposureMeta ? 'auto' : 'image',
       manual: !!result.manual,
       cameraReady: true,
       hardwareZoomMax: result.hardwareZoomMax || 1,
@@ -255,14 +260,6 @@ async function startCamera() {
     }
 
     lastAe = 0;
-
-    if (!result.manual) {
-      toast('此设备不支持相机手动曝光，已启用相对测光', {
-        type: 'warn',
-        duration: 4200,
-        action: { label: '去设置', onClick: () => onNavigateCb && onNavigateCb('settings') }
-      });
-    }
   } catch (err) {
     showCameraError(err);
   } finally {
@@ -377,12 +374,17 @@ function currentExposure() {
   if (camera && camera.isActive) {
     const ex = camera.getExposure();
     if (Number.isFinite(ex.shutter) && Number.isFinite(ex.iso)) {
-      return { shutter: ex.shutter, iso: ex.iso, manual: !!camera.manual };
+      return { shutter: ex.shutter, iso: ex.iso, manual: !!camera.manual, absolute: true };
     }
     return null;
   }
   if (demo) {
-    return { shutter: demo.exposure.shutter, iso: demo.exposure.iso, manual: true };
+    return {
+      shutter: demo.exposure.shutter,
+      iso: demo.exposure.iso,
+      manual: true,
+      absolute: true
+    };
   }
   return null;
 }
@@ -417,10 +419,11 @@ function cancelLoop() {
 
 function evForLuma(luma, s, ex) {
   const L = clamp(luma, 1e-4, 1);
-  if (ex && ex.manual) {
+  if (ex && ex.absolute) {
     const n = s.lensAperture;
     return log2((n * n) / ex.shutter) - log2(ex.iso / 100) + log2(L / MID_GRAY) + s.calibration;
   }
+  // 无曝光元数据：图像亮度 + 场景基准 EV（实时图像测光）
   return s.anchorEv + log2(L / MID_GRAY) + s.calibration;
 }
 
@@ -741,7 +744,11 @@ function updateReadout(force = false) {
   if (locked) {
     setText(dom.evSub, '已锁定 · 点按解除后重新测光');
   } else {
-    setText(dom.evSub, `${MODE_META[s.mode].label} · ${sourceLabel(rt.source)}`);
+    const base = `${MODE_META[s.mode].label} · ${sourceLabel(rt.source)}`;
+    setText(
+      dom.evSub,
+      rt.source === 'image' ? `${base} · 基准 ${s.anchorEv.toFixed(1)}` : base
+    );
   }
 
   setText(dom.metricLum, formatLuminance(luminanceFromEv(ev)));
@@ -1259,20 +1266,23 @@ function showEngineInfo() {
   const rt = getRuntime();
   const s = getSettings();
   const caps = rt.capabilities || {};
+  const ex = currentExposure();
   const exposureRange = caps.exposureTime
     ? `${formatShutterExact(caps.exposureTime.min)} – ${formatShutter(caps.exposureTime.max, {
         snap: false
       })}`
     : '—';
+  const manualCap = Array.isArray(caps.exposureMode) && caps.exposureMode.includes('manual');
   const rows = [
     ['数据来源', sourceLabel(rt.source)],
-    ['手动曝光', rt.manual ? '已接管' : '不可用'],
+    ['曝光元数据', ex ? `${formatShutter(ex.shutter)} · ISO ${ex.iso}` : '未提供'],
+    ['手动曝光', rt.manual ? '已接管' : manualCap ? '设备支持 · 未启用' : '不支持'],
     ['相机快门范围', exposureRange],
     ['相机 ISO 范围', caps.iso ? `${Math.round(caps.iso.min)} – ${Math.round(caps.iso.max)}` : '—'],
     ['硬件变焦', rt.hardwareZoomMax > 1.02 ? `1× – ${Number(rt.hardwareZoomMax).toFixed(1)}×` : '不支持'],
     ['换算光圈', formatAperture(s.lensAperture)],
     ['校准偏移', `${s.calibration >= 0 ? '+' : ''}${s.calibration.toFixed(1)} EV`],
-    ['相对锚点', 'EV ' + s.anchorEv.toFixed(1)]
+    ['图像基准 EV', 'EV ' + s.anchorEv.toFixed(1)]
   ];
   const section = document.createElement('div');
   section.className = 'sheet-section';
@@ -1287,9 +1297,20 @@ function showEngineInfo() {
   section.appendChild(grid);
   const note = document.createElement('p');
   note.className = 'picker-note';
-  note.innerHTML = rt.manual
-    ? '当前设备支持相机手动曝光，LIGHTNO 会接管曝光并反推绝对 EV。'
-    : '当前浏览器不允许网页修改相机曝光，已启用相对测光：请设置一个场景锚点 EV，或改用支持手动曝光的浏览器（如 Android Chrome）。';
+  let noteText;
+  if (rt.source === 'demo') {
+    noteText = '演示场景：曝光参数由程序生成，仅用于体验界面与算法。';
+  } else if (rt.source === 'error') {
+    noteText = '相机未运行。你仍可使用「拍照测光」读取照片 EXIF，或进入演示模式。';
+  } else if (rt.manual) {
+    noteText = '当前设备支持手动曝光：LIGHTNO 接管相机曝光，并用图像亮度反推绝对 EV。';
+  } else if (ex) {
+    noteText = '相机自动曝光参数可用：LIGHTNO 用这些参数 + 图像亮度输出绝对 EV。';
+  } else {
+    noteText =
+      '浏览器未提供相机曝光参数：实时读数由图像亮度 + 图像基准 EV 决定。要绝对 EV，点画面左下角「拍照测光」读取照片 EXIF；如果设备支持手动曝光，也可在设置 → 测光引擎里切换硬件曝光。';
+  }
+  note.innerHTML = noteText;
   section.appendChild(note);
 
   openSheet({

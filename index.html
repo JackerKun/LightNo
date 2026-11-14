@@ -84,6 +84,19 @@
               <div class="hud-sub" id="hudHint">拖动测光框 · 双指缩放</div>
             </div>
 
+            <button class="stage-photo" id="btnPhotoMeter" type="button" aria-label="拍照测光：读取照片 EXIF">
+              <span class="stage-photo__icon">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path
+                    d="M4.5 8.5h3l1.5-2h6l1.5 2h3A1.5 1.5 0 0121 10v8.5a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 18.5V10a1.5 1.5 0 011.5-1.5z"
+                    stroke-linejoin="round"
+                  />
+                  <circle cx="12" cy="14" r="3.2" />
+                </svg>
+              </span>
+              <span class="stage-photo__label">拍照测光</span>
+            </button>
+
             <button class="shutter" id="btnCapture" type="button" aria-label="保存测光照片与参数">
               <span class="shutter__halo" aria-hidden="true"></span>
               <span class="shutter__core">
@@ -306,6 +319,14 @@
             <h3 class="group__title">测光引擎</h3>
 
             <div class="setrow">
+              <div class="setrow__label"><b>测光引擎</b><span>图像分析不接管相机曝光</span></div>
+              <div class="seg" id="segEngine">
+                <button type="button" data-value="image">图像分析</button>
+                <button type="button" data-value="hardware">硬件曝光</button>
+              </div>
+            </div>
+
+            <div class="setrow">
               <div class="setrow__label"><b>数据来源</b><span id="capNote">检测中…</span></div>
               <span class="badge" id="capBadge">—</span>
             </div>
@@ -332,7 +353,7 @@
             </div>
 
             <button class="setrow setrow--btn" id="btnAnchor" type="button">
-              <span class="setrow__label"><b>相对测光锚点</b><span>设备不支持手动曝光时，作为场景 EV 基准</span></span>
+              <span class="setrow__label"><b>图像测光基准</b><span>无曝光元数据时的场景平均 EV</span></span>
               <span class="setrow__value" id="setAnchorValue">EV 12.0</span>
               <span class="setrow__chev">›</span>
             </button>
@@ -444,6 +465,8 @@
           </ul>
         </div>
       </div>
+
+      <input type="file" id="photoInput" accept="image/*" class="sr-only" />
 
       <nav class="tabbar" aria-label="主导航">
         <button class="tab is-active" type="button" data-target="meter" aria-current="page">

@@ -135,13 +135,13 @@ export function pickAnchor(current, onSelect) {
   section.appendChild(presetWrap);
   section.appendChild(
     note(
-      '仅当设备不支持相机手动曝光时使用：以场景平均亮度为基准，再计算点 / 区域相对亮度。<br />数值来自其他测光表、晴天 16 法则或已知光照。'
+      '实时图像测光没有相机曝光元数据时，用它作为场景平均 EV 基准，再按图像亮度计算点 / 区域 EV。<br />数值可来自其他测光表、晴天 16 法则或已知光照。iPhone 想要绝对读数，优先用画面左下角的「拍照测光」（读取照片 EXIF）。'
     )
   );
 
   openSheet({
-    title: '相对测光锚点',
-    subtitle: '当前设备的降级测光基准',
+    title: '图像测光基准',
+    subtitle: '场景平均 EV，实时图像测光的绝对锚点',
     content: section,
     actions: [
       { label: '取消', kind: 'ghost', onClick: () => closeSheet() },
@@ -338,9 +338,9 @@ export function openCalibration({ getLiveEv, onDone }) {
   section.appendChild(presetWrap);
   section.appendChild(
     note(
-      `如果读数本身已经准确，可直接点击「应用校准」（此时参考值 = 当前读数）。<br />当前偏移 <b>${settings.calibration.toFixed(
+      `如果读数本身已经准确，可直接点击「应用校准」（此时参考值 = 当前读数）。<br />实时图像测光没有曝光元数据时，校准会调整图像基准的偏差；拍照测光用照片 EXIF 定锚，校准只修正相机 JPEG 的中灰映射。偏移 <b>${settings.calibration.toFixed(
         1
-      )} EV</b>，只会保存在本机。`
+      )} EV</b> 只保存在本机。`
     )
   );
 
@@ -387,6 +387,7 @@ export function openMeterOptions({ getEv } = {}) {
   const settings = getSettings();
   const section = document.createElement('div');
   section.className = 'sheet-section';
+  const photoInput = document.getElementById('photoInput');
 
   function pairNow() {
     const s = getSettings();
@@ -414,6 +415,15 @@ export function openMeterOptions({ getEv } = {}) {
     <button class="setrow setrow--btn" id="optTargetZone" type="button" style="padding-left:0;padding-right:0">
       <span class="setrow__label"><b>点测光目标影调</b><span>Zone V = 18% 中灰</span></span>
       <span class="setrow__value" id="optZoneValue">ZONE ${zoneRoman(settings.targetZone)}</span>
+      <span class="setrow__chev">›</span>
+    </button>
+    <button class="setrow setrow--btn" id="optAnchor" type="button" style="padding-left:0;padding-right:0">
+      <span class="setrow__label"><b>图像测光基准</b><span>无曝光元数据时的场景平均 EV</span></span>
+      <span class="setrow__value" id="optAnchorValue">EV ${settings.anchorEv.toFixed(1)}</span>
+      <span class="setrow__chev">›</span>
+    </button>
+    <button class="setrow setrow--btn" id="optPhotoMeter" type="button" style="padding-left:0;padding-right:0">
+      <span class="setrow__label"><b>拍照测光</b><span>读取系统相机照片 EXIF，得到绝对 EV</span></span>
       <span class="setrow__chev">›</span>
     </button>
     <div class="range-block">
@@ -489,6 +499,19 @@ export function openMeterOptions({ getEv } = {}) {
     });
   });
 
+  section.querySelector('#optAnchor').addEventListener('click', () => {
+    pickAnchor(getSettings().anchorEv, (value) => {
+      updateSettings({ anchorEv: value });
+      const valueEl = section.querySelector('#optAnchorValue');
+      if (valueEl) valueEl.textContent = 'EV ' + value.toFixed(1);
+    });
+  });
+
+  section.querySelector('#optPhotoMeter').addEventListener('click', () => {
+    closeSheet();
+    if (photoInput) photoInput.click();
+  });
+
   openSheet({
     title: '测光选项',
     subtitle: '只影响测光方式，不改变相机画面',
@@ -507,7 +530,9 @@ export function openAlgorithmDoc() {
     <p>其中 <code>N</code> 是镜头光圈（设置项），<code>t</code>、<code>S</code> 是相机实际使用的快门与 ISO，0.18 为 18% 中灰。</p>
 
     <h4>数据来源</h4>
-    <p>支持手动曝光的设备（多数 Android Chrome）由 LIGHTNO 接管相机曝光，并自动把测光区调整到中灰附近，因此得到绝对 EV。iOS Safari 等不开放手动曝光的浏览器会降级为「相对测光」，此时需要用锚点 EV 作为场景基准。</p>
+    <p><b>实时图像测光</b>：读取预览画面的线性亮度 <code>L</code>。若浏览器提供相机曝光参数（手动或自动），用 <code>EV = log2(N²/t) − log2(S/100) + log2(L/0.18) + 校准</code> 得到绝对 EV；若没有（iPhone Safari 常见），用 <code>EV = 基准EV + log2(L/0.18) + 校准</code> 得到相对读数。</p>
+    <p><b>拍照测光</b>：用系统相机拍一张照片，读取 JPEG EXIF 的快门 <code>t</code>、光圈 <code>N</code>、ISO <code>S</code>，再按所选区域亮度反推 <code>EV = log2(N²/t) − log2(S/100) + log2(L/0.18) + 校准</code>。EXIF 是照片自带的元数据，不依赖网页的硬件曝光控制，因此 iPhone 也能得到绝对 EV。</p>
+    <p>iOS Safari 不开放相机手动曝光，而且自动曝光会把画面亮度归一化。实时预览没有曝光元数据时无法知道绝对光量，只能做相对测光；拍照测光用照片 EXIF 绕开了这个限制。</p>
 
     <h4>曝光优先</h4>
     <p>光圈优先：<code>t = N² / 2^(EV100 + log2(S/100) − ND)</code><br />
@@ -528,7 +553,7 @@ export function openAlgorithmDoc() {
     <p>ND 不改变场景 EV，只改变推荐曝光：光圈优先时 <code>t' = t × 2^ND档数</code>；快门优先时由光圈补偿。例如 EV 12、f/8、ISO 100 的基准快门是 1/64s，装 ND16（4 档）后直接使用 1/4s。</p>
 
     <h4>校准</h4>
-    <p>不同手机预览的色彩曲线并不完全一致。对准 18% 灰卡，输入一个已知 EV，LIGHTNO 会把偏差写入本机，长期有效。</p>
+    <p>不同手机预览 / JPEG 的色彩曲线并不完全一致。对准 18% 灰卡，输入一个已知 EV，LIGHTNO 会把偏差写入本机，长期有效。拍照测光的 EXIF 已提供绝对锚点，校准主要修正相机 JPEG 的中灰映射。</p>
 
     <h4>隐私</h4>
     <p>相机画面只在内存中处理；保存的照片与参数写入浏览器 IndexedDB，不上传到任何服务器。</p>
@@ -593,9 +618,17 @@ export function openOnboarding({ onDone } = {}) {
           <p>测完光点一下 <b>EV 数字</b>（或右上角锁 / 双击画面）即可 HOLD：读数、直方图、斑马纹都会冻结，移动手机去设置相机也不会变。点「解除」继续测光。</p>
         </div>
       </div>
+      <div class="onboard__item">
+        <span class="onboard__num">07</span>
+        <div>
+          <b>iPhone：用拍照测光拿绝对 EV</b>
+          <p>点取景框左下角的相机按钮，用系统相机拍一张场景照片。LIGHTNO 会读取照片 EXIF 的快门 / 光圈 / ISO，再结合你拖动的测光区，得到绝对 EV；照片和参数可以直接存入记录。</p>
+        </div>
+      </div>
     </div>
     <p class="picker-note" style="margin-top:14px">
-      没有相机权限？可以在取景框的提示里进入演示模式，先熟悉界面与读数。
+      没有相机权限？可以在取景框的提示里进入演示模式，先熟悉界面与读数。<br />
+      实时图像测光没有曝光元数据时，用「图像测光基准」或校准确定绝对读数；iPhone 推荐「拍照测光」。
     </p>
   `;
 

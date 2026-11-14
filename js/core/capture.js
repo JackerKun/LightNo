@@ -39,8 +39,8 @@ function roundRect(ctx, x, y, w, h, r) {
 
 function sourceSize(source) {
   return {
-    width: source.videoWidth || source.width || 0,
-    height: source.videoHeight || source.height || 0
+    width: source.videoWidth || source.naturalWidth || source.width || 0,
+    height: source.videoHeight || source.naturalHeight || source.height || 0
   };
 }
 

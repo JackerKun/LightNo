@@ -1,13 +1,13 @@
 {
   "name": "lightno",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "LIGHTNO — 移动端摄影测光表 PWA（点测光 / 区域测光 / 平均测光 / ND / 测光日志）",
   "scripts": {
     "start": "node server.mjs",
     "icons": "node tools/make-icons.mjs",
-    "test": "node tests/run.mjs && node tests/store.test.mjs",
+    "test": "node tests/run.mjs && node tests/store.test.mjs && node tests/exif.test.mjs",
     "verify": "node tools/verify.mjs"
   },
   "keywords": [

@@ -1,9 +1,9 @@
 /**
  * LIGHTNO · 相机控制
  *
- * 关键点：网页无法直接读取手机镜头的光圈/快门，只能通过 MediaStreamTrack
- * 的 capabilities 判断是否支持「手动曝光」。支持时（多数 Android Chrome），
- * 我们接管曝光，用已知的 t / ISO 精确反推 EV；不支持时降级为相对测光。
+ * 默认「图像分析」引擎不修改相机曝光，只读取视频帧。
+ * 只有用户在设置里选择「硬件曝光」且设备支持时，才尝试启用手动曝光，
+ * 用已知的 t / ISO 反推绝对 EV。
  */
 
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
@@ -58,7 +58,7 @@ export class Camera {
     return !!(this.capabilities && this.capabilities.torch);
   }
 
-  async start() {
+  async start({ allowManual = true } = {}) {
     if (typeof window !== 'undefined' && window.isSecureContext === false) {
       throw new CameraError('INSECURE', '当前页面不是安全上下文', '请使用 https:// 或 http://localhost 打开');
     }
@@ -100,11 +100,12 @@ export class Camera {
     await this.waitForFrame();
     this.readCapabilities();
 
+    if (!allowManual) this.manual = false;
     if (this.manual) {
       try {
         await this.enableManual();
       } catch (err) {
-        console.warn('[LIGHTNO] 手动曝光开启失败，降级为相对测光', err);
+        console.warn('[LIGHTNO] 手动曝光开启失败，降级为图像测光', err);
         this.manual = false;
       }
     }

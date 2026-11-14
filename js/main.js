@@ -4,6 +4,7 @@
 import { $, $$ } from './ui/dom.js';
 import { getSettings, updateSettings, getRuntime, setRuntime } from './core/state.js';
 import { createMeter } from './ui/meter.js';
+import { createPhotoMeter } from './ui/photoMeter.js';
 import { createHistory } from './ui/history.js';
 import { createSettings } from './ui/settings.js';
 import { openOnboarding, openCalibration } from './ui/pickers.js';
@@ -117,7 +118,7 @@ function scheduleCalibrationHint() {
     if (hintShown) return;
     const s = getSettings();
     const rt = getRuntime();
-    if (s.calibrated || rt.source !== 'hardware') return;
+    if (s.calibrated || !['hardware', 'auto', 'image'].includes(rt.source)) return;
     hintShown = true;
     toast('建议用 18% 灰卡校准一次，读数会更准', {
       type: 'info',
@@ -139,13 +140,21 @@ function boot() {
   });
 
   history = createHistory({ onCount: setBadge });
+  createPhotoMeter({
+    onSaved: () => {
+      if (history) history.refresh();
+    }
+  });
 
   settingsView = createSettings({
     getLiveEv: () => (meter ? meter.getLiveEv() : NaN),
     onCleared: () => {
       if (history) history.refresh();
     },
-    onInstall: promptInstall
+    onInstall: promptInstall,
+    onEngineChange: () => {
+      if (meter) meter.retryCamera();
+    }
   });
 
   initPWA();

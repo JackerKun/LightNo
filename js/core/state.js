@@ -30,6 +30,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   zone: { cx: 0.5, cy: 0.5 },
   zoom: 1,
   // 引擎
+  engine: 'image',
   lensAperture: 1.8,
   calibration: 0,
   anchorEv: 12,
@@ -72,6 +73,7 @@ function sanitize(input) {
     },
     zoom: clampNum(s.zoom, 1, 12, 1),
     lensAperture: clampNum(s.lensAperture, 0.95, 5.6, 1.8),
+    engine: s.engine === 'hardware' ? 'hardware' : 'image',
     calibration: clampNum(s.calibration, -6, 6, 0),
     anchorEv: clampNum(s.anchorEv, -6, 22, 12),
     fps: clampNum(s.fps, 4, 20, 10),
@@ -102,7 +104,7 @@ const state = {
   runtime: {
     view: 'meter',
     locked: false,
-    source: 'init', // init | hardware | relative | demo | error
+    source: 'init', // init | hardware | auto | image | demo | error
     cameraReady: false,
     manual: false,
     hardwareZoomMax: 1,
