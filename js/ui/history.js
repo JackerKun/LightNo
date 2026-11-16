@@ -30,6 +30,7 @@ import { hapticTap } from './haptic.js';
 
 const SOURCE_LABELS = {
   hardware: '硬件测光',
+  native: '原生测光',
   auto: '自动测光',
   image: '图像测光',
   relative: '图像测光',
@@ -335,7 +336,7 @@ async function exportBackup() {
         d.getHours()
       )}${pad(d.getMinutes())}.json`
     );
-    toast(`已导出 ${payload.shots.length} 条记录`, { type: 'success', duration: 3000 });
+    toast(`已打包 ${payload.shots.length} 条记录`, { type: 'success', duration: 3000 });
   } catch (err) {
     console.error('[LIGHTNO] export failed', err);
     toast('导出失败：' + (err.message || err), { type: 'error' });

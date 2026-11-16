@@ -1,10 +1,13 @@
 /**
  * LIGHTNO · 相机控制
  *
- * 默认「图像分析」引擎不修改相机曝光，只读取视频帧。
- * 只有用户在设置里选择「硬件曝光」且设备支持时，才尝试启用手动曝光，
- * 用已知的 t / ISO 反推绝对 EV。
+ * 在浏览器和镜头允许时启用手动快门和 ISO。
  */
+
+// Chromium 的 MediaStream 曝光单位为 100 µs。应用内使用秒。
+const SECONDS_PER_EXPOSURE_UNIT = 1e-4;
+export const isAndroid = typeof navigator !== 'undefined' &&
+  (/Android/i.test(navigator.userAgent) || navigator.userAgentData?.platform === 'Android');
 
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 
@@ -20,6 +23,7 @@ export class CameraError extends Error {
 export class Camera {
   constructor(video) {
     this.video = video;
+    this.startVersion = 0;
     this.stream = null;
     this.track = null;
     this.capabilities = {};
@@ -67,6 +71,7 @@ export class Camera {
     }
 
     this.stop();
+    const version = this.startVersion;
 
     let stream;
     try {
@@ -83,6 +88,10 @@ export class Camera {
       throw translateError(err);
     }
 
+    if (version !== this.startVersion) {
+      for (const track of stream.getTracks()) track.stop();
+      throw new CameraError('CANCELLED', '相机已停止');
+    }
     this.stream = stream;
     this.track = stream.getVideoTracks()[0];
     if (!this.track) throw new CameraError('NO_TRACK', '未获取到视频轨道');
@@ -98,6 +107,7 @@ export class Camera {
     }
 
     await this.waitForFrame();
+    if (version !== this.startVersion) throw new CameraError('CANCELLED', '相机已停止');
     this.readCapabilities();
 
     if (!allowManual) this.manual = false;
@@ -110,6 +120,7 @@ export class Camera {
       }
     }
 
+    if (version !== this.startVersion) throw new CameraError('CANCELLED', '相机已停止');
     this.syncSettings();
     this.emit('ready', {
       manual: this.manual,
@@ -124,22 +135,30 @@ export class Camera {
   }
 
   stop() {
+    this.startVersion++;
     if (this.stream) {
       for (const track of this.stream.getTracks()) track.stop();
+      if (this.video?.srcObject === this.stream) this.video.srcObject = null;
     }
     this.stream = null;
     this.track = null;
     this.manual = false;
     this.settings = {};
-    if (this.video) this.video.srcObject = null;
     this.emit('stopped');
   }
 
   readCapabilities() {
-    const caps = this.track && this.track.getCapabilities ? this.track.getCapabilities() : {};
-    this.capabilities = caps || {};
-    this.exposureRange = caps.exposureTime || null;
-    this.isoRange = caps.iso || null;
+    const caps = this.track?.getCapabilities?.() || {};
+    this.capabilities = caps;
+    this.exposureRange = Number.isFinite(caps?.exposureTime?.min) && caps.exposureTime.min > 0 &&
+      Number.isFinite(caps.exposureTime.max) && caps.exposureTime.max >= caps.exposureTime.min
+      ? {
+          min: caps.exposureTime.min * SECONDS_PER_EXPOSURE_UNIT,
+          max: caps.exposureTime.max * SECONDS_PER_EXPOSURE_UNIT
+        }
+      : null;
+    this.isoRange = Number.isFinite(caps?.iso?.min) && caps.iso.min > 0 &&
+      Number.isFinite(caps.iso.max) && caps.iso.max >= caps.iso.min ? caps.iso : null;
     this.zoomRange = caps.zoom || null;
     const modes = caps.exposureMode;
     this.manual = !!(
@@ -160,11 +179,21 @@ export class Camera {
   getExposure() {
     const s = this.syncSettings();
     return {
-      shutter: Number.isFinite(s.exposureTime) ? s.exposureTime : null,
-      iso: Number.isFinite(s.iso) ? s.iso : null,
+      shutter: Number.isFinite(s.exposureTime) && s.exposureTime > 0
+        ? s.exposureTime * SECONDS_PER_EXPOSURE_UNIT
+        : null,
+      iso: Number.isFinite(s.iso) && s.iso > 0 ? s.iso : null,
       mode: s.exposureMode || 'continuous',
       zoom: Number.isFinite(s.zoom) ? s.zoom : 1
     };
+  }
+
+  getManualExposure() {
+    if (!this.manual) return null;
+    const ex = this.getExposure();
+    // Chrome's Android Camera2 backend can return "none" with auto exposure off.
+    const manualMode = ex.mode === 'manual' || (isAndroid && ex.mode === 'none');
+    return manualMode && ex.shutter !== null && ex.iso !== null ? ex : null;
   }
 
   async enableManual() {
@@ -172,14 +201,14 @@ export class Camera {
     const shutter = clamp(1 / 60, this.exposureRange.min, this.exposureRange.max);
     const iso = clamp(100, this.isoRange.min, this.isoRange.max);
     await this.track.applyConstraints({
-      advanced: [{ exposureMode: 'manual', exposureTime: shutter, iso }]
+      advanced: [{ exposureMode: 'manual', exposureTime: shutter / SECONDS_PER_EXPOSURE_UNIT, iso }]
     });
-    const s = this.syncSettings();
-    if (s.exposureMode !== 'manual') {
+    const ex = this.getManualExposure();
+    if (!ex) {
       this.manual = false;
       return false;
     }
-    this.emit('manual', { shutter: s.exposureTime, iso: s.iso });
+    this.emit('manual', ex);
     return true;
   }
 
@@ -188,10 +217,11 @@ export class Camera {
     if (!this.manual || !this.track) return null;
     const t = clamp(Number(shutter) || 1 / 60, this.exposureRange.min, this.exposureRange.max);
     const s = clamp(Number(iso) || 100, this.isoRange.min, this.isoRange.max);
+    const settings = { exposureMode: 'manual', exposureTime: t / SECONDS_PER_EXPOSURE_UNIT, iso: s };
+    const zoom = this.syncSettings().zoom;
+    if (Number.isFinite(zoom) && this.zoomRange) settings.zoom = zoom;
     try {
-      await this.track.applyConstraints({
-        advanced: [{ exposureMode: 'manual', exposureTime: t, iso: s }]
-      });
+      await this.track.applyConstraints({ advanced: [settings] });
     } catch (err) {
       console.warn('[LIGHTNO] setExposure failed', err);
       return null;
@@ -210,8 +240,15 @@ export class Camera {
     }
     const min = Number.isFinite(this.zoomRange.min) ? this.zoomRange.min : 1;
     const target = clamp(Number(value) || 1, min, this.zoomRange.max);
+    const settings = { zoom: target };
+    const exposure = this.getManualExposure();
+    if (exposure) {
+      settings.exposureMode = 'manual';
+      settings.exposureTime = exposure.shutter / SECONDS_PER_EXPOSURE_UNIT;
+      settings.iso = exposure.iso;
+    }
     try {
-      await this.track.applyConstraints({ advanced: [{ zoom: target }] });
+      await this.track.applyConstraints({ advanced: [settings] });
     } catch (err) {
       console.warn('[LIGHTNO] setZoom failed', err);
       return { applied: 1, hardware: false };

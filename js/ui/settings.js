@@ -9,6 +9,7 @@ import {
   subscribe,
   resetSettings
 } from '../core/state.js';
+import { hasNativeCamera } from '../core/nativeCamera.js';
 import { clearShots, countShots, storageEstimate } from '../core/store.js';
 import { zoneRoman, formatAperture } from '../core/exposure.js';
 import { openSheet, closeSheet } from './sheet.js';
@@ -16,7 +17,6 @@ import { toast } from './toast.js';
 import { hapticTap } from './haptic.js';
 import {
   pickLens,
-  pickAnchor,
   pickTargetZone,
   openCalibration,
   openAlgorithmDoc
@@ -47,19 +47,22 @@ function renderCapability() {
   if (!badge || !note) return;
   badge.className = 'badge';
 
-  if (rt.source === 'hardware') {
+  if (rt.source === 'native') {
+    badge.textContent = '原生测光';
+    badge.classList.add('is-ok');
+    note.textContent = '使用后置主摄的快门、ISO 和光圈';
+  } else if (rt.source === 'hardware') {
     badge.textContent = '手动曝光';
     badge.classList.add('is-ok');
-    note.textContent = '已接管相机曝光，可输出绝对 EV';
-  } else if (rt.source === 'auto') {
-    badge.textContent = '自动测光';
-    badge.classList.add('is-ok');
-    note.textContent = '读取相机自动曝光参数 + 图像分析，输出绝对 EV';
+    note.textContent = '使用手机快门、ISO 和镜头固定光圈估算 EV';
+  } else if (rt.source === 'exif') {
+    badge.textContent = '自动 EXIF';
+    badge.classList.add(rt.exifFailed ? 'is-warn' : 'is-ok');
+    note.textContent = rt.exifStatus || '在取景时读取自动样本的曝光参数';
   } else if (rt.source === 'image' || rt.source === 'relative') {
-    badge.textContent = '图像测光';
+    badge.textContent = '画面分析';
     badge.classList.add('is-ok');
-    note.textContent =
-      '仅靠图像亮度分析；可用基准 EV / 校准，iPhone 也可用拍照测光读取 EXIF。设置里可切换硬件曝光（若支持）';
+    note.textContent = '查看画面明暗。计算胶片曝光可用拍照测光。';
   } else if (rt.source === 'demo') {
     badge.textContent = '演示模式';
     badge.classList.add('is-demo');
@@ -75,6 +78,7 @@ function renderCapability() {
 }
 
 async function updateStorage() {
+  if (hasNativeCamera) return;
   const note = $('#storageNote');
   if (!note) return;
   try {
@@ -95,9 +99,12 @@ function sync() {
   const s = getSettings();
 
   setText($('#setLensValue'), formatAperture(s.lensAperture));
-  setText($('#setCalibValue'), `${s.calibration >= 0 ? '+' : ''}${s.calibration.toFixed(1)} EV`);
-  setText($('#calibNote'), s.calibrated ? '已校准 · 点击可重新校准' : '建议用灰卡校准一次');
-  setText($('#setAnchorValue'), 'EV ' + s.anchorEv.toFixed(1));
+  if (hasNativeCamera) setText($('#calibTitle'), '原生测光校准');
+  const calibration = hasNativeCamera ? s.nativeCalibration : s.calibration;
+  setText($('#setCalibValue'), `${calibration >= 0 ? '+' : ''}${calibration.toFixed(1)} EV`);
+  const calibrationNote = hasNativeCamera ? '先在取景页测量同一张灰卡'
+    : s.calibrated ? '已校准 · 点击可重新校准' : '硬件曝光读数可用时校准';
+  setText($('#calibNote'), calibrationNote);
   setText($('#setTargetZoneValue'), 'ZONE ' + zoneRoman(s.targetZone));
 
   const spotRange = $('#rangeSpotSize');
@@ -204,14 +211,7 @@ export function createSettings({
   const calibBtn = $('#btnCalibrate');
   if (calibBtn) {
     calibBtn.addEventListener('click', () => {
-      openCalibration({ getLiveEv: () => getLiveEvFn() });
-    });
-  }
-
-  const anchorBtn = $('#btnAnchor');
-  if (anchorBtn) {
-    anchorBtn.addEventListener('click', () => {
-      pickAnchor(getSettings().anchorEv, (v) => updateSettings({ anchorEv: v }));
+      openCalibration({ getLiveEv: () => getLiveEvFn(), source: hasNativeCamera ? 'native' : 'hardware' });
     });
   }
 

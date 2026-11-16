@@ -1,6 +1,6 @@
 /**
  * 生成 PWA 图标（纯 Node，无第三方依赖）
- * 输出：assets/icons/icon-180.png, icon-192.png, icon-512.png, maskable-512.png
+ * 生成网页版图标和 iPhone 的 AppIcon。
  * 运行：npm run icons
  */
 import fs from 'node:fs';
@@ -38,18 +38,18 @@ function chunk(type, data) {
   return Buffer.concat([len, body, crc]);
 }
 
-function encodePNG(width, height, rgba) {
-  const stride = width * 4;
+function encodePNG(width, height, pixels, channels) {
+  const stride = width * channels;
   const raw = Buffer.alloc((stride + 1) * height);
   for (let y = 0; y < height; y++) {
     raw[y * (stride + 1)] = 0;
-    rgba.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+    pixels.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
   }
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
   ihdr[8] = 8;
-  ihdr[9] = 6;
+  ihdr[9] = channels === 4 ? 6 : 2;
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
@@ -68,8 +68,8 @@ const smoothstep = (edge0, edge1, x) => {
 };
 const mix = (a, b, t) => a + (b - a) * t;
 
-function renderIcon(size, { safe = 1 } = {}) {
-  const px = Buffer.alloc(size * size * 4);
+function renderIcon(size, { safe = 1, channels = 4 } = {}) {
+  const px = Buffer.alloc(size * size * channels);
   const scale = safe; // 内容缩放（maskable 留安全区）
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
@@ -111,14 +111,14 @@ function renderIcon(size, { safe = 1 } = {}) {
         (Math.abs(nx) > Math.abs(ny) * 1.6 || Math.abs(ny) > Math.abs(nx) * 1.6 ? 0.55 : 0);
       r = mix(r, 120, tick); g = mix(g, 190, tick); b = mix(b, 255, tick);
 
-      const idx = (y * size + x) * 4;
+      const idx = (y * size + x) * channels;
       px[idx] = Math.round(Math.min(255, r));
       px[idx + 1] = Math.round(Math.min(255, g));
       px[idx + 2] = Math.round(Math.min(255, b));
-      px[idx + 3] = 255;
+      if (channels === 4) px[idx + 3] = 255;
     }
   }
-  return encodePNG(size, size, px);
+  return encodePNG(size, size, px, channels);
 }
 
 const targets = [
@@ -134,3 +134,9 @@ for (const [name, size, safe] of targets) {
   console.log('✓', name, png.length + ' bytes');
 }
 console.log('icons written to assets/icons');
+
+const appIconDir = path.join(root, 'ios', 'LightNo', 'Assets.xcassets', 'AppIcon.appiconset');
+fs.mkdirSync(appIconDir, { recursive: true });
+const appIcon = renderIcon(1024, { safe: 0.9, channels: 3 });
+fs.writeFileSync(path.join(appIconDir, 'AppIcon.png'), appIcon);
+console.log('✓ iOS AppIcon', appIcon.length + ' bytes');

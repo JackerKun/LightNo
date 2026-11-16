@@ -55,6 +55,8 @@
         <section class="view view--meter" id="view-meter" data-view="meter">
           <div class="stage" id="stage">
             <video class="stage__video" id="camera" playsinline autoplay muted></video>
+            <canvas class="stage__video" id="nativePreview" width="0" height="0" hidden aria-label="相机取景"></canvas>
+            <div class="exposure-zones" id="exposureZones" hidden aria-hidden="true"></div>
             <canvas class="stage__zebra" id="zebra" width="80" height="107" aria-hidden="true"></canvas>
             <div class="stage__grid" id="grid" hidden aria-hidden="true"></div>
             <div class="stage__vignette" aria-hidden="true"></div>
@@ -84,7 +86,7 @@
               <div class="hud-sub" id="hudHint">拖动测光框 · 双指缩放</div>
             </div>
 
-            <button class="stage-photo" id="btnPhotoMeter" type="button" aria-label="拍照测光：读取照片 EXIF">
+            <button class="stage-photo" id="btnPhotoMeter" data-web-only type="button" aria-label="拍照测光：读取照片 EXIF">
               <span class="stage-photo__icon">
                 <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8">
                   <path
@@ -96,6 +98,14 @@
               </span>
               <span class="stage-photo__label">拍照测光</span>
             </button>
+
+            <div class="zone-controls">
+              <div class="zone-legend" id="zoneLegend" hidden>
+                <span>暗部</span><span>中间调</span><span>高光</span>
+              </div>
+              <button class="tag zone-toggle" id="btnExposureZones" type="button" aria-pressed="false"
+                aria-label="分区曝光预览" aria-controls="exposureZones">分区</button>
+            </div>
 
             <button class="shutter" id="btnCapture" type="button" aria-label="保存测光照片与参数">
               <span class="shutter__halo" aria-hidden="true"></span>
@@ -148,7 +158,7 @@
                 title="锁定 / 解除当前读数"
               >
                 <span class="ev__top">
-                  <span class="ev__key">EV<sub>100</sub></span>
+                  <span class="ev__key" id="evKey">画面亮度差</span>
                   <span class="ev__hold" id="evHoldPill">
                     <svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" stroke-width="2.2">
                       <rect x="5" y="10.5" width="14" height="9.5" rx="2.2" />
@@ -159,7 +169,7 @@
                 </span>
                 <span class="ev__line">
                   <span class="ev__value" id="evValue">--.-</span>
-                  <span class="ev__unit">EV</span>
+                  <span class="ev__unit" id="evUnit">档</span>
                   <svg
                     class="ev__lockicon"
                     id="evLockIcon"
@@ -178,7 +188,7 @@
                 <span class="ev__sub" id="evSub">正在启动相机…</span>
               </button>
               <div class="metrics">
-                <div class="metric"><span>亮度</span><b id="metricLum">—</b></div>
+                <div class="metric"><span id="metricLumLabel">选区亮度</span><b id="metricLum">—</b></div>
                 <div class="metric"><span>反差</span><b id="metricDr">—</b></div>
                 <div class="metric"><span>色温</span><b id="metricCct">—</b></div>
                 <div class="metric"><span>区域</span><b id="metricZone">—</b></div>
@@ -244,7 +254,11 @@
               </div>
             </div>
 
-            <div class="ladder" id="ladder" aria-label="等效曝光组合"></div>
+            <div class="film-actions" id="filmActions" data-web-only>
+              <button class="btn btn--primary" id="btnFilmMeter" type="button">拍照计算胶片曝光</button>
+              <button class="btn btn--ghost" id="btnImportMeter" type="button">导入原片</button>
+            </div>
+            <div class="ladder" id="ladder" role="group" aria-label="等效曝光组合，点按选择并锁定"></div>
 
             <div class="modebar">
               <div class="modes" id="modeRow" role="tablist" aria-label="测光模式">
@@ -318,10 +332,11 @@
           <div class="group">
             <h3 class="group__title">测光引擎</h3>
 
-            <div class="setrow">
-              <div class="setrow__label"><b>测光引擎</b><span>图像分析不接管相机曝光</span></div>
+            <div class="setrow" data-web-only>
+              <div class="setrow__label"><b>测光引擎</b><span>iPhone 自动取样，安卓优先硬件曝光</span></div>
               <div class="seg" id="segEngine">
-                <button type="button" data-value="image">图像分析</button>
+                <button type="button" data-value="auto">自动</button>
+                <button type="button" data-value="relative">画面分析</button>
                 <button type="button" data-value="hardware">硬件曝光</button>
               </div>
             </div>
@@ -331,32 +346,27 @@
               <span class="badge" id="capBadge">—</span>
             </div>
 
-            <button class="setrow setrow--btn" id="btnLens" type="button">
-              <span class="setrow__label"><b>镜头光圈</b><span>仅用于 EV 换算，手机主摄通常 f/1.8</span></span>
+            <button class="setrow setrow--btn" id="btnLens" data-web-only type="button">
+              <span class="setrow__label"><b>镜头光圈</b><span>硬件曝光时填入手机当前镜头的固定光圈</span></span>
               <span class="setrow__value" id="setLensValue">f/1.8</span>
               <span class="setrow__chev">›</span>
             </button>
 
             <button class="setrow setrow--btn" id="btnCalibrate" type="button">
-              <span class="setrow__label"><b>校准偏移</b><span id="calibNote">建议用灰卡校准一次</span></span>
+              <span class="setrow__label"><b id="calibTitle">硬件曝光校准</b><span id="calibNote">建议用灰卡校准一次</span></span>
               <span class="setrow__value" id="setCalibValue">0.0 EV</span>
               <span class="setrow__chev">›</span>
             </button>
 
             <div class="setrow">
-              <div class="setrow__label"><b>采样频率</b><span>更高更灵敏，也更耗电</span></div>
+              <div class="setrow__label"><b>取景速度</b><span>流畅模式刷新更快，也更耗电</span></div>
               <div class="seg" id="segFps">
                 <button type="button" data-value="6">节能</button>
                 <button type="button" data-value="10">标准</button>
-                <button type="button" data-value="15">高精度</button>
+                <button type="button" data-value="15">流畅</button>
               </div>
             </div>
 
-            <button class="setrow setrow--btn" id="btnAnchor" type="button">
-              <span class="setrow__label"><b>图像测光基准</b><span>无曝光元数据时的场景平均 EV</span></span>
-              <span class="setrow__value" id="setAnchorValue">EV 12.0</span>
-              <span class="setrow__chev">›</span>
-            </button>
           </div>
 
           <div class="group">
@@ -403,7 +413,7 @@
           <div class="group">
             <h3 class="group__title">记录与存储</h3>
 
-            <div class="setrow">
+            <div class="setrow" data-web-only>
               <div class="setrow__label"><b>写入地理位置</b><span>仅在保存时请求，数据留在本机</span></div>
               <button class="switch" id="swGeotag" type="button" role="switch" aria-label="地理位置"></button>
             </div>
@@ -426,16 +436,16 @@
             <h3 class="group__title">关于</h3>
 
             <div class="setrow">
-              <div class="setrow__label"><b>版本</b><span>LIGHTNO PWA</span></div>
+              <div class="setrow__label"><b>版本</b><span id="versionPlatform">LIGHTNO PWA</span></div>
               <span class="setrow__value">1.0.0</span>
             </div>
 
-            <button class="setrow setrow--btn" id="btnAlgorithm" type="button">
+            <button class="setrow setrow--btn" id="btnAlgorithm" data-web-only type="button">
               <span class="setrow__label"><b>测光算法说明</b><span>EV、ND、Zone 与校准原理</span></span>
               <span class="setrow__chev">›</span>
             </button>
 
-            <button class="setrow setrow--btn" id="btnInstall" type="button">
+            <button class="setrow setrow--btn" id="btnInstall" data-web-only type="button">
               <span class="setrow__label"><b>安装到桌面</b><span id="installNote">离线可用，像 App 一样启动</span></span>
               <span class="setrow__chev">›</span>
             </button>
@@ -447,7 +457,7 @@
           </div>
 
           <p class="footnote">
-            所有图像与读数仅保存在本机浏览器（IndexedDB），不会上传到任何服务器。
+            点按保存时，取景照片和测光读数才会写入本机记录。
           </p>
         </section>
       </main>
@@ -466,7 +476,8 @@
         </div>
       </div>
 
-      <input type="file" id="photoInput" accept="image/*" class="sr-only" />
+      <input type="file" id="photoInput" data-web-only accept="image/*" class="sr-only" />
+      <input type="file" id="cameraPhotoInput" data-web-only accept="image/*" capture="environment" class="sr-only" />
 
       <nav class="tabbar" aria-label="主导航">
         <button class="tab is-active" type="button" data-target="meter" aria-current="page">

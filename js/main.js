@@ -3,6 +3,7 @@
  */
 import { $, $$ } from './ui/dom.js';
 import { getSettings, updateSettings, getRuntime, setRuntime } from './core/state.js';
+import { hasNativeCamera } from './core/nativeCamera.js';
 import { createMeter } from './ui/meter.js';
 import { createPhotoMeter } from './ui/photoMeter.js';
 import { createHistory } from './ui/history.js';
@@ -118,7 +119,7 @@ function scheduleCalibrationHint() {
     if (hintShown) return;
     const s = getSettings();
     const rt = getRuntime();
-    if (s.calibrated || !['hardware', 'auto', 'image'].includes(rt.source)) return;
+    if (s.calibrated || rt.source !== 'hardware') return;
     hintShown = true;
     toast('建议用 18% 灰卡校准一次，读数会更准', {
       type: 'info',
@@ -132,6 +133,8 @@ function scheduleCalibrationHint() {
 }
 
 function boot() {
+  document.body.classList.toggle('native-host', hasNativeCamera);
+  if (hasNativeCamera) $('#versionPlatform').textContent = 'LIGHTNO · 原生相机';
   meter = createMeter({
     onSaved: () => {
       if (history) history.refresh();
@@ -140,11 +143,7 @@ function boot() {
   });
 
   history = createHistory({ onCount: setBadge });
-  createPhotoMeter({
-    onSaved: () => {
-      if (history) history.refresh();
-    }
-  });
+  if (!hasNativeCamera) createPhotoMeter({ onSaved: () => history.refresh() });
 
   settingsView = createSettings({
     getLiveEv: () => (meter ? meter.getLiveEv() : NaN),
@@ -157,17 +156,17 @@ function boot() {
     }
   });
 
-  initPWA();
+  if (!hasNativeCamera) initPWA();
   registerEvents();
 
   if (preferDemo) meter.startDemo();
 
   const initial = window.location.hash.replace('#', '');
   showView(VIEWS.includes(initial) ? initial : 'meter');
-  setBadge(history.getCount());
+  if (history) setBadge(history.getCount());
 
   const settings = getSettings();
-  if (!settings.onboarded && !skipIntro && !preferDemo) {
+  if (!hasNativeCamera && !settings.onboarded && !skipIntro && !preferDemo) {
     setTimeout(() => {
       openOnboarding({
         onDone: () => {

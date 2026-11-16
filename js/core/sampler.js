@@ -77,6 +77,7 @@ function makeStats(sum, weight, clip, hist, rgb) {
 export function analyze(data, width, height, region = {}, options = {}) {
   const lut = options.lut || SRGB_TO_LINEAR;
   const shape = region.shape || 'full';
+  const full = shape === 'full';
   const minDim = Math.min(width, height);
 
   const cx = (region.cx != null ? region.cx : 0.5) * width;
@@ -87,10 +88,10 @@ export function analyze(data, width, height, region = {}, options = {}) {
   const inv2Sigma2 = 1 / (2 * gaussSigma * gaussSigma);
 
   const hist = new Float32Array(HIST_BINS);
-  const regionHist = new Float32Array(HIST_BINS);
+  const regionHist = full ? hist : new Float32Array(HIST_BINS);
   const gridW = 80;
   const gridH = Math.max(1, Math.round((gridW * height) / width));
-  const clipMap = new Uint8Array(gridW * gridH);
+  const clipMap = options.clipMap === false ? null : new Uint8Array(gridW * gridH);
   const cellX = width / gridW;
   const cellY = height / gridH;
 
@@ -126,14 +127,14 @@ export function analyze(data, width, height, region = {}, options = {}) {
       const clipped = luma >= CLIP_THRESHOLD;
       if (clipped) {
         fClip++;
-        clipMap[gy * gridW + Math.min(gridW - 1, (x / cellX) | 0)] = 1;
+        if (clipMap) clipMap[gy * gridW + Math.min(gridW - 1, (x / cellX) | 0)] = 1;
       }
-      hist[binOf(luma)]++;
+      const bin = binOf(luma);
+      hist[bin]++;
+      if (full) continue;
 
       let wgt = 0;
-      if (shape === 'full') {
-        wgt = 1;
-      } else if (shape === 'circle' || shape === 'spot') {
+      if (shape === 'circle' || shape === 'spot') {
         const dx = x + 0.5 - cx;
         const dy = py - cy;
         const d = Math.sqrt(dx * dx + dy * dy);
@@ -162,14 +163,14 @@ export function analyze(data, width, height, region = {}, options = {}) {
         rg += g * wgt;
         rb += b * wgt;
         if (clipped) rClip += wgt;
-        regionHist[binOf(luma)] += wgt;
+        regionHist[bin] += wgt;
       }
     }
   }
 
   const frame = makeStats(fSum, fCount, fClip, hist, [fr, fg, fb]);
   let regionStats;
-  if (shape === 'full') {
+  if (full) {
     regionStats = { ...frame, coverage: 1 };
   } else {
     regionStats = makeStats(rSum, rWeight, rClip, regionHist, [rr, rg, rb]);
@@ -184,8 +185,39 @@ export function analyze(data, width, height, region = {}, options = {}) {
     region: regionStats,
     hist,
     regionHist,
-    clipMap: { width: gridW, height: gridH, data: clipMap }
+    clipMap: clipMap && { width: gridW, height: gridH, data: clipMap }
   };
+}
+
+export const EXPOSURE_ZONE_GRID = 4;
+
+/** 将预览方格的线性亮度相对于测光区换算为 Zone 0～X。 */
+export function sampleExposureZones({ data, width, height }, referenceLuma, referenceZone) {
+  const size = EXPOSURE_ZONE_GRID;
+  const zones = new Uint8Array(size * size);
+  const reference = Math.max(referenceLuma, 1e-4);
+  for (let row = 0; row < size; row++) {
+    const top = Math.floor(row * height / size);
+    const bottom = Math.floor((row + 1) * height / size);
+    for (let col = 0; col < size; col++) {
+      const left = Math.floor(col * width / size);
+      const right = Math.floor((col + 1) * width / size);
+      let sum = 0;
+      let count = 0;
+      for (let y = top; y < bottom; y += 3) {
+        for (let x = left; x < right; x += 3) {
+          const i = (y * width + x) * 4;
+          sum += 0.2126 * SRGB_TO_LINEAR[data[i]]
+            + 0.7152 * SRGB_TO_LINEAR[data[i + 1]]
+            + 0.0722 * SRGB_TO_LINEAR[data[i + 2]];
+          count++;
+        }
+      }
+      const relativeEv = Math.log2(Math.max(sum / Math.max(count, 1), 1e-4) / reference);
+      zones[row * size + col] = clampInt(Math.round(referenceZone + relativeEv), 0, 10);
+    }
+  }
+  return zones;
 }
 
 /**
@@ -203,6 +235,31 @@ export class FrameSampler {
 
   get height() {
     return this.canvas.height;
+  }
+
+  /** A small uncropped patch around the point sent to the native AE engine. */
+  sampleAnchor(source, { x, y }) {
+    const { width, height } = source;
+    const size = Math.min(width, height) * 0.2;
+    if (!(size > 0)) return null;
+    const edge = 24;
+    if (this.width !== edge || this.height !== edge) {
+      this.canvas.width = this.canvas.height = edge;
+    }
+    const left = Math.max(0, Math.min(width - size, x * width - size / 2));
+    const top = Math.max(0, Math.min(height - size, y * height - size / 2));
+    this.ctx.drawImage(source, left, top, size, size, 0, 0, edge, edge);
+    const { data } = this.ctx.getImageData(0, 0, edge, edge);
+    let total = 0;
+    let clipped = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const luma = 0.2126 * SRGB_TO_LINEAR[data[i]]
+        + 0.7152 * SRGB_TO_LINEAR[data[i + 1]]
+        + 0.0722 * SRGB_TO_LINEAR[data[i + 2]];
+      total += luma;
+      if (luma >= CLIP_THRESHOLD) clipped++;
+    }
+    return { mean: total / (edge * edge), clip: clipped / (edge * edge) };
   }
 
   /**

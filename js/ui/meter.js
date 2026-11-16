@@ -3,7 +3,7 @@
  *
  * 数据流：
  *   camera/video → FrameSampler（线性亮度）→ analyze（区域统计）
- *   → 求 EV（相机曝光元数据 或 图像基准）→ 平滑 → 读数 / 推荐曝光 / 记录
+ *   → 求 EV（有效的相机曝光元数据）→ 平滑 → 读数 / 推荐曝光 / 记录
  */
 import { $, setText, timeLabel, shortDate, uid } from './dom.js';
 import {
@@ -14,13 +14,17 @@ import {
   subscribe,
   MODE_META
 } from '../core/state.js';
-import { Camera, translateError } from '../core/camera.js';
-import { FrameSampler, analyze, LOG_MIN, LOG_RANGE } from '../core/sampler.js';
+import { Camera, isAndroid } from '../core/camera.js';
+import { hasNativeCamera, NativeCamera, setNativeKeepAwake } from '../core/nativeCamera.js';
+import { estimateNativeExposure } from '../core/nativeExposure.js';
+import { watchPreviewExif } from '../core/previewExif.js';
+import { FrameSampler, analyze, LOG_MIN, LOG_RANGE, EXPOSURE_ZONE_GRID, sampleExposureZones } from '../core/sampler.js';
 import { createDemoScene } from '../core/demo.js';
 import { putShot } from '../core/store.js';
 import { composePhoto } from '../core/capture.js';
 import {
   MID_GRAY,
+  evFromExposure,
   log2,
   clamp,
   shutterFromEv,
@@ -32,7 +36,6 @@ import {
   formatLuminance,
   formatCct,
   ndLabel,
-  ndDensity,
   zoneRoman,
   contrastStops,
   cctFromLinearRgb,
@@ -43,7 +46,7 @@ import {
   ISOS,
   SHUTTERS
 } from '../core/exposure.js';
-import { openSheet, closeSheet } from './sheet.js';
+import { openSheet, closeSheet, isSheetOpen } from './sheet.js';
 import { toast } from './toast.js';
 import { hapticTap, hapticSave, hapticError } from './haptic.js';
 import { attachStageGestures } from './gestures.js';
@@ -60,7 +63,11 @@ import { setWakeLock } from '../core/wake.js';
 const dom = {
   stage: $('#stage'),
   video: $('#camera'),
+  nativePreview: $('#nativePreview'),
   zebra: $('#zebra'),
+  exposureZones: $('#exposureZones'),
+  zoneToggle: $('#btnExposureZones'),
+  zoneLegend: $('#zoneLegend'),
   grid: $('#grid'),
   histogram: $('#histogram'),
   zone: $('#zone'),
@@ -81,6 +88,11 @@ const dom = {
   retry: $('#btnRetryCam'),
   demoBtn: $('#btnDemo'),
   evValue: $('#evValue'),
+  evKey: $('#evKey'),
+  evUnit: $('#evUnit'),
+  filmMeter: $('#btnFilmMeter'),
+  filmActions: $('#filmActions'),
+  metricLumLabel: $('#metricLumLabel'),
   evSub: $('#evSub'),
   evHold: $('#evHold'),
   evHoldText: $('#evHoldText'),
@@ -117,10 +129,30 @@ const dom = {
 
 let camera = null;
 const sampler = new FrameSampler();
+const nativeAnchorSampler = hasNativeCamera ? new FrameSampler() : null;
 let demo = null;
 let sourceEl = null;
 let running = false;
-let cameraStarting = false;
+let startingCamera = null;
+let stopExifWatch = null;
+let exifSample = null;
+let exifExpiry;
+let exifContext = 0;
+let exifSelectionWarning = '';
+let hardwareSelectionWarning = '';
+const NATIVE_SETTLE_GRACE_MS = 450;
+let nativeWarning = '';
+let nativeLastGoodAt = -Infinity;
+const NATIVE_EXPOSURE_WARNINGS = {
+  offset: '当前光线超出手机相机的测光范围',
+  point: '当前相机无法指定测光点，请切换平均测光',
+  metadata: '相机尚未提供有效的曝光参数',
+  preview: '预览太亮或太暗，区域估算不稳定 · 可切换点测光'
+};
+let zoomPending = false;
+const EXIF_MAX_AGE = 5000;
+const appleMobile = /iPhone|iPad|iPod/i.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 let rafId = null;
 let usingVideoFrameCallback = false;
 let lastSample = 0;
@@ -128,11 +160,16 @@ let lastUi = 0;
 let lastAe = 0;
 let stats = null;
 let evSmooth = null;
+let selectedLuma = null;
 let lockSnapshot = null;
 let cameraHwZoom = 1;
 let digitalZoom = 1;
 let shotBusy = false;
-let ladderSignature = '';
+const LADDER_GRACE_MS = 1000;
+const ladderItems = [];
+let lastLadderReading = null;
+let ladderRenderKey = '';
+const zoneCells = [];
 let gestureCtl = null;
 let wakeActive = false;
 let started = false;
@@ -147,6 +184,7 @@ const zone = {
 
 let zoomToken = 0;
 let exposureBusy = false;
+let hardwareSettledAfter = 0;
 
 function stageAspect() {
   const rect = dom.stage.getBoundingClientRect();
@@ -158,11 +196,13 @@ function sourceLabel(source) {
   switch (source) {
     case 'hardware':
       return '硬件测光';
-    case 'auto':
-      return '自动测光';
+    case 'native':
+      return '原生测光';
+    case 'exif':
+      return '自动 EXIF 测光';
     case 'image':
     case 'relative':
-      return '图像测光';
+      return '画面分析';
     case 'demo':
       return '演示模式';
     case 'error':
@@ -218,61 +258,170 @@ function showCameraError(err) {
 }
 
 async function startCamera() {
-  if (cameraStarting) return;
-  cameraStarting = true;
+  if (!running || startingCamera || document.visibilityState === 'hidden') return;
+  stopCamera();
+  const session = hasNativeCamera ? new NativeCamera(dom.nativePreview, {
+    onFrame: () => {
+      if (sourceEl !== dom.nativePreview || camera !== session) return;
+      syncNativeMeterPoint();
+      if (!lockSnapshot || getSettings().showExposureZones) onFrame(performance.now());
+    },
+    onStale: () => {
+      if (camera !== session) return;
+      dom.exposureZones.hidden = true;
+      if (lockSnapshot) return;
+      evSmooth = null;
+      nativeLastGoodAt = -Infinity;
+      nativeWarning = '等待原生相机读数…';
+      updateReadout(true);
+    },
+    onError: (error) => {
+      if (camera !== session) return;
+      stopCamera();
+      evSmooth = null;
+      showCameraError(error);
+      updateReadout(true);
+    }
+  }) : new Camera(dom.video);
+  camera = session;
+  startingCamera = session;
+  if (lockSnapshot?.source === 'demo') {
+    lockSnapshot = null;
+    setRuntime({ locked: false });
+  }
   unmountDemoLayer();
-  if (!camera) camera = new Camera(dom.video);
+  lastSample = 0;
+  nativeLastGoodAt = -Infinity;
+  nativeWarning = '';
+  evSmooth = null;
+  stats = null;
   setRuntime({ source: 'init', cameraReady: false, cameraError: null });
   updateStatus();
+  updateReadout(true);
   dom.fallback.hidden = true;
 
   try {
-    const result = await camera.start({ allowManual: getSettings().engine === 'hardware' });
-    const caps = result.capabilities || {};
-    const ex = camera.getExposure();
-    const hasExposureMeta = Number.isFinite(ex.shutter) && Number.isFinite(ex.iso);
+    const { engine, fps } = getSettings();
+    const autoExif = !hasNativeCamera && engine === 'auto' && appleMobile;
+    const allowManual = engine === 'hardware' || (engine === 'auto' && isAndroid);
+    const result = await session.start({ allowManual, previewFps: lockSnapshot ? 4 : Math.round(fps) });
+    if (camera !== session) return;
+
+    const caps = result.capabilities;
+    const source = hasNativeCamera ? 'native' : autoExif ? 'exif' : cameraExposure() ? 'hardware' : 'image';
     setRuntime({
-      source: result.manual ? 'hardware' : hasExposureMeta ? 'auto' : 'image',
-      manual: !!result.manual,
+      source,
+      exifStatus: autoExif ? '正在读取自动曝光样本…' : null,
+      exifFailed: false,
+      manual: result.manual,
       cameraReady: true,
-      hardwareZoomMax: result.hardwareZoomMax || 1,
+      hardwareZoomMax: result.hardwareZoomMax,
       capabilities: {
         exposureMode: caps.exposureMode || null,
-        exposureTime: caps.exposureTime ? { ...caps.exposureTime } : null,
-        iso: caps.iso ? { ...caps.iso } : null,
-        zoom: caps.zoom ? { ...caps.zoom } : null,
-        torch: !!caps.torch
+        exposureTime: session.exposureRange,
+        iso: session.isoRange,
+        zoom: caps.zoom || null
       },
       cameraError: null
     });
-    sourceEl = dom.video;
+    sourceEl = hasNativeCamera ? dom.nativePreview : dom.video;
+    syncNativePreviewRate();
     cameraHwZoom = 1;
     updateZoomRange();
     updateStatus();
     await applyZoom(getSettings().zoom);
+    if (camera !== session) return;
 
-    if (getRuntime().locked && lockSnapshot && lockSnapshot.cameraExposure && camera.manual) {
-      try {
-        await camera.setExposure(lockSnapshot.cameraExposure);
-      } catch {
-        /* ignore */
-      }
+    if (lockSnapshot?.source === 'hardware' && lockSnapshot.cameraExposure && session.manual) {
+      await session.setExposure(lockSnapshot.cameraExposure);
+      if (camera !== session) return;
     }
 
     lastAe = 0;
+    hardwareSettledAfter = performance.now() + 200;
+    if (autoExif) startExifWatch(session);
+    if (rafId == null) schedule();
   } catch (err) {
+    if (camera !== session) return;
+    stopCamera();
     showCameraError(err);
+    updateReadout(true);
   } finally {
-    cameraStarting = false;
+    if (startingCamera === session) startingCamera = null;
   }
 }
 
 function stopCamera() {
+  dom.exposureZones.hidden = true;
+  stopExifWatch?.();
+  stopExifWatch = null;
+  exifContext++;
+  clearExifSample();
+  startingCamera = null;
+  zoomPending = false;
+  exposureBusy = false;
+  zoomToken++;
   if (camera) {
     camera.stop();
     camera = null;
   }
-  if (sourceEl === dom.video) sourceEl = null;
+  if (sourceEl === dom.video || sourceEl === dom.nativePreview) {
+    cancelLoop();
+    sourceEl = null;
+  }
+}
+
+function clearExifSample() {
+  clearTimeout(exifExpiry);
+  exifSample = null;
+  exifSelectionWarning = '';
+  if (getRuntime().source === 'exif') evSmooth = null;
+}
+
+function startExifWatch(session) {
+  const report = (message, exifFailed = false) => {
+    clearExifSample();
+    if (exifFailed) stopExifWatch = null;
+    setRuntime({ exifStatus: message, exifFailed });
+    updateReadout(true);
+  };
+  if (typeof ImageCapture !== 'function' || typeof createImageBitmap !== 'function') {
+    report('浏览器不支持自动取样', true);
+    return;
+  }
+  try {
+    stopExifWatch = watchPreviewExif(session.track, {
+      getContext: () => camera === session && running && !zoomPending &&
+        document.visibilityState === 'visible' && !isSheetOpen() && !lockSnapshot
+        ? exifContext : null,
+      onSample: (bitmap, exposure, sampledAt) => {
+        const image = sampler.draw(bitmap, { aspect: stageAspect(), zoom: digitalZoom, width: 192 });
+        const remaining = EXIF_MAX_AGE - (performance.now() - sampledAt);
+        if (!image || remaining <= 0) throw new Error('自动取样已失效');
+
+        clearTimeout(exifExpiry);
+        exifSample = { image, exposure };
+        exifExpiry = setTimeout(() => report('等待新曝光样本…'), remaining);
+        setRuntime({ exifStatus: null });
+        updateExifReading();
+        updateReadout(true);
+      },
+      onError: (message) => report(message, true)
+    });
+  } catch {
+    report('浏览器无法启动自动取样', true);
+  }
+}
+
+function updateExifReading() {
+  if (!exifSample || lockSnapshot) return;
+  const { image, exposure } = exifSample;
+  const s = getSettings();
+  const result = analyze(image.data, image.width, image.height, buildRegion(s.mode));
+  const measured = computeEv(result, s, exposure, s.autoExifCalibration);
+  exifSelectionWarning = exposureSampleProblem(result, s.mode, measured.luma);
+  evSmooth = exifSelectionWarning ? null : measured.ev;
+  currentZoneValue = measured.zoneValue;
 }
 
 function mountDemoLayer() {
@@ -285,31 +434,30 @@ function mountDemoLayer() {
   }
   canvas.hidden = false;
   dom.video.hidden = true;
+  dom.nativePreview.hidden = true;
 }
 
 function unmountDemoLayer() {
   if (demo && demo.canvas.isConnected) demo.canvas.hidden = true;
-  dom.video.hidden = false;
+  dom.video.hidden = hasNativeCamera;
+  dom.nativePreview.hidden = !hasNativeCamera;
 }
 
 function startDemo() {
   if (!demo) demo = createDemoScene();
-  if (camera) {
-    camera.stop();
-    camera = null;
-  }
+  stopCamera();
   mountDemoLayer();
-  setRuntime({ source: 'demo', cameraReady: true, manual: false, cameraError: null });
+  lockSnapshot = null;
+  stats = null;
+  setRuntime({ source: 'demo', cameraReady: true, manual: false, locked: false, cameraError: null });
   sourceEl = demo.canvas;
   dom.fallback.hidden = true;
   evSmooth = null;
   lastAe = 0;
   updateStatus();
   toast('演示模式：程序绘制的场景，可直接体验测光', { duration: 3000 });
-  if (!running) {
-    running = true;
-    schedule();
-  }
+  running = true;
+  if (rafId == null) schedule();
 }
 
 async function ensureSource() {
@@ -320,7 +468,7 @@ async function ensureSource() {
     return;
   }
   if (camera && camera.isActive) {
-    sourceEl = dom.video;
+    sourceEl = hasNativeCamera ? dom.nativePreview : dom.video;
     return;
   }
   await startCamera();
@@ -338,10 +486,19 @@ async function applyZoom(value) {
   const max = Number(dom.zoomInput.max) || 8;
   const target = clamp(Number(value) || 1, 1, max);
 
+  if (getRuntime().source === 'exif' && target !== getSettings().zoom) {
+    exifContext++;
+    clearExifSample();
+    if (stopExifWatch) setRuntime({ exifStatus: '正在读取自动曝光样本…' });
+    updateReadout(true);
+  }
   let hw = 1;
   if (camera && camera.isActive) {
+    zoomPending = true;
     const res = await camera.setZoom(target);
     if (token !== zoomToken) return;
+    zoomPending = false;
+    if (res.hardware && camera?.manual) hardwareSettledAfter = performance.now() + 200;
     hw = res.hardware ? clamp(res.applied, 1, max) : 1;
   }
 
@@ -349,7 +506,7 @@ async function applyZoom(value) {
   digitalZoom = target / hw;
   updateSettings({ zoom: target }, { silent: true });
   setRuntime({ digitalZoom, hardwareApplied: hw, zoom: target });
-  const visual = sourceEl === dom.video ? dom.video : demo ? demo.canvas : null;
+  const visual = sourceEl;
   if (visual) {
     visual.style.transform = digitalZoom > 1.001 ? `scale(${digitalZoom.toFixed(4)})` : '';
   }
@@ -358,38 +515,36 @@ async function applyZoom(value) {
   dom.tagZoom.hidden = target <= 1.01;
   setText(dom.tagZoom, target.toFixed(1) + '×');
   updateZone();
+  syncNativeMeterPoint();
 }
 
 async function syncWakeLock() {
   const want = running && getSettings().keepAwake;
   if (want === wakeActive) return;
   wakeActive = want;
+  if (hasNativeCamera) {
+    setNativeKeepAwake(want);
+    return;
+  }
   const ok = await setWakeLock(want);
   if (want && ok === false) {
     toast('此设备不支持屏幕常亮', { type: 'warn', duration: 2200 });
   }
 }
 
-function currentExposure() {
-  if (camera && camera.isActive) {
-    const ex = camera.getExposure();
-    if (Number.isFinite(ex.shutter) && Number.isFinite(ex.iso)) {
-      return { shutter: ex.shutter, iso: ex.iso, manual: !!camera.manual, absolute: true };
-    }
-    return null;
-  }
-  if (demo) {
-    return {
-      shutter: demo.exposure.shutter,
-      iso: demo.exposure.iso,
-      manual: true,
-      absolute: true
-    };
-  }
-  return null;
+function cameraExposure() {
+  if (!camera?.isActive || !camera.manual) return null;
+  return camera.getManualExposure();
 }
 
-function buildRegion(mode, s) {
+function currentExposure() {
+  if (getRuntime().source === 'exif') return exifSample?.exposure || null;
+  if (getRuntime().source === 'native') return camera?.exposure || null;
+  if (getRuntime().source === 'demo' && demo) return demo.exposure;
+  return cameraExposure();
+}
+
+function buildRegion(mode) {
   const shape = MODE_META[mode].shape;
   if (shape === 'full') return { shape: 'full' };
   if (shape === 'center') return { shape: 'center', cx: 0.5, cy: 0.5, size: 0.52 };
@@ -397,7 +552,7 @@ function buildRegion(mode, s) {
 }
 
 function schedule() {
-  if (!running) return;
+  if (!running || sourceEl === dom.nativePreview) return;
   if (sourceEl === dom.video && dom.video.requestVideoFrameCallback) {
     usingVideoFrameCallback = true;
     rafId = dom.video.requestVideoFrameCallback(onFrame);
@@ -417,36 +572,85 @@ function cancelLoop() {
   rafId = null;
 }
 
-function evForLuma(luma, s, ex) {
-  const L = clamp(luma, 1e-4, 1);
-  if (ex && ex.absolute) {
-    const n = s.lensAperture;
-    return log2((n * n) / ex.shutter) - log2(ex.iso / 100) + log2(L / MID_GRAY) + s.calibration;
+function computeEv(result, s, ex, calibration = s.calibration) {
+  let luma = result.region.mean;
+  let zoneValue = 5;
+  if (s.mode === 'spot' || s.mode === 'area') {
+    zoneValue = s.targetZone;
+  } else if (s.mode === 'highlight') {
+    luma = result.frame.p98;
+    zoneValue = 8;
+  } else if (s.mode === 'shadow') {
+    luma = result.frame.p02;
+    zoneValue = 3;
   }
-  // 无曝光元数据：图像亮度 + 场景基准 EV（实时图像测光）
-  return s.anchorEv + log2(L / MID_GRAY) + s.calibration;
+  if (!ex) return { ev: null, zoneValue, luma };
+
+  const cameraEv = evFromExposure({
+    aperture: ex.aperture ?? s.lensAperture,
+    shutter: ex.shutter,
+    iso: ex.iso
+  });
+  const ev = cameraEv + log2(Math.max(luma, 1e-4) / MID_GRAY) + calibration - (zoneValue - 5);
+  return { ev, zoneValue, luma };
 }
 
-function computeEv(result, s, ex) {
-  const mode = s.mode;
+function syncNativePreviewRate() {
+  if (hasNativeCamera) camera?.setPreviewRate(lockSnapshot ? 4 : Math.round(getSettings().fps));
+}
+
+function syncNativeMeterPoint() {
+  const preview = dom.nativePreview;
+  if (sourceEl !== preview || !camera?.isActive || lockSnapshot || !preview.width || !preview.height) return;
+
+  const mode = getSettings().mode;
+  let x = 0.5;
+  let y = 0.5;
   if (mode === 'spot' || mode === 'area') {
-    const luma = result.region.mean;
-    return { ev: evForLuma(luma, s, ex) - (s.targetZone - 5), zoneValue: s.targetZone, luma };
+    const sourceAspect = preview.width / preview.height;
+    const aspect = stageAspect();
+    // Map the selection through the same centered crop and zoom as FrameSampler.
+    x += (zone.cx - 0.5) * Math.min(1, aspect / sourceAspect) / digitalZoom;
+    y += (zone.cy - 0.5) * Math.min(1, sourceAspect / aspect) / digitalZoom;
   }
-  if (mode === 'center') {
-    const luma = result.region.mean;
-    return { ev: evForLuma(luma, s, ex), zoneValue: 5, luma };
+
+  if (camera.setMeterPoint(x, y)) {
+    evSmooth = null;
+    nativeLastGoodAt = -Infinity;
+    nativeWarning = '等待测光区曝光稳定…';
+    updateReadout(true);
   }
-  if (mode === 'highlight') {
-    const luma = Math.max(result.frame.p98, 1e-5);
-    return { ev: evForLuma(luma, s, ex) - 3, zoneValue: 8, luma };
-  }
-  if (mode === 'shadow') {
-    const luma = Math.max(result.frame.p02, 1e-5);
-    return { ev: evForLuma(luma, s, ex) + 2, zoneValue: 3, luma };
-  }
-  const luma = result.frame.mean;
-  return { ev: evForLuma(luma, s, ex), zoneValue: 5, luma };
+}
+
+function computeNativeEv(result, s, ex) {
+  const measured = computeEv(result, s, null);
+  const anchor = ex && !ex.adjusting && s.mode !== 'spot'
+    ? nativeAnchorSampler.sampleAnchor(dom.nativePreview, camera.point)
+    : null;
+  const estimate = estimateNativeExposure({
+    exposure: ex,
+    mode: s.mode,
+    luma: measured.luma,
+    anchor,
+    zoneValue: measured.zoneValue,
+    calibration: s.nativeCalibration
+  });
+  nativeWarning = estimate.settling ? '曝光更新中…' : NATIVE_EXPOSURE_WARNINGS[estimate.reason] || '';
+  return { ...measured, ...estimate };
+}
+
+function exposureSampleProblem(result, mode, luma) {
+  if (luma < 0.005) return '测光区太暗 · 请调整测光区';
+  const clipped = luma >= 0.95 || ((mode === 'spot' || mode === 'area' || mode === 'center') && result.region.clip > 0.05);
+  return clipped ? '测光区高光裁切 · 请调整测光区' : '';
+}
+
+/** 去掉影调放置造成的曝光偏移，恢复用于对照的反射测光读数。 */
+function referenceReading() {
+  if (!lockSnapshot && getRuntime().source === 'native' && nativeWarning) return null;
+  const ev = currentEv();
+  const zoneValue = lockSnapshot?.zoneValue ?? currentZoneValue;
+  return Number.isFinite(ev) ? ev + zoneValue - 5 : null;
 }
 
 /** 依据当前曝光优先模式，求光圈 / 快门组合 */
@@ -481,10 +685,13 @@ function aeTargetValue(mode) {
 let currentZoneValue = 5;
 
 function onFrame(now) {
+  rafId = null;
   if (!running) return;
   const s = getSettings();
-  const interval = 1000 / clamp(s.fps, 4, 20);
-  if (now - lastSample < interval * 0.85) {
+  const nativeSource = sourceEl === dom.nativePreview;
+  const elapsed = now - lastSample;
+  const interval = 1000 / (nativeSource ? Math.min(s.fps, 10) : clamp(s.fps, 4, 20));
+  if (elapsed < interval * 0.85) {
     schedule();
     return;
   }
@@ -509,19 +716,31 @@ function onFrame(now) {
   const image = sampler.draw(sourceEl, {
     aspect: rect.width / rect.height,
     zoom: digitalZoom,
-    width: s.fps >= 15 ? 320 : 256
+    width: nativeSource ? (s.fps >= 15 ? 192 : 144) : (s.fps >= 15 ? 320 : 256)
   });
   if (!image) {
     schedule();
     return;
   }
 
-  const ex = currentExposure();
-  const result = analyze(image.data, image.width, image.height, buildRegion(s.mode, s));
-  stats = result;
+  const exifSource = rt.source === 'exif';
+  const ex = exifSource ? null : currentExposure();
+  const adjustingHardware = !!camera?.manual &&
+    (zoomPending || exposureBusy || now < hardwareSettledAfter);
+  if (camera?.isActive && !exifSource && !nativeSource) {
+    const source = ex ? 'hardware' : 'image';
+    if (rt.source !== source) {
+      evSmooth = null;
+      setRuntime({ source });
+      updateStatus();
+    }
+  }
+  const result = analyze(image.data, image.width, image.height, buildRegion(s.mode), {
+    clipMap: s.showZebra && !rt.locked
+  });
 
   // ---- 相机自动曝光：把测光区压到可用范围，保证读数不溢出 ----
-  if (camera && camera.manual && ex && !rt.locked && !shotBusy && now - lastAe > 320) {
+  if (camera?.manual && ex && !adjustingHardware && !rt.locked && !shotBusy && now - lastAe > 320) {
     const y = clamp(aeTargetLuma(result, s.mode), 0.001, 0.98);
     const err = log2(y / aeTargetValue(s.mode));
     if (Math.abs(err) > 0.42) {
@@ -531,27 +750,43 @@ function onFrame(now) {
       const targetT = ex.shutter * factor;
       const t = clamp(targetT, tr.min, tr.max);
       const iso = clamp(ex.iso * (targetT / t), ir.min, ir.max);
-      if (!exposureBusy) {
+      if (Math.abs(t - ex.shutter) > 1e-5 || Math.abs(iso - ex.iso) > 1) {
+        const session = camera;
         exposureBusy = true;
-        camera
-          .setExposure({ shutter: t, iso })
-          .catch(() => {})
-          .finally(() => {
-            exposureBusy = false;
-          });
+        session.setExposure({ shutter: t, iso }).catch(() => {}).finally(() => {
+          if (camera !== session) return;
+          hardwareSettledAfter = performance.now() + 200;
+          exposureBusy = false;
+        });
       }
       lastAe = now;
     }
   }
 
   // ---- 计算 EV ----
-  const measured = computeEv(result, s, ex);
+  const measured = nativeSource ? computeNativeEv(result, s, ex) : computeEv(result, s, ex);
   if (!rt.locked) {
-    const alpha = clamp(s.smoothing, 0.05, 1);
-    evSmooth = evSmooth == null ? measured.ev : evSmooth + (measured.ev - evSmooth) * alpha;
-    currentZoneValue = measured.zoneValue;
+    const waitingWithReading = nativeSource && measured.settling
+      && Number.isFinite(evSmooth) && now - nativeLastGoodAt < NATIVE_SETTLE_GRACE_MS;
+    if (!waitingWithReading) stats = result;
+    hardwareSelectionWarning = rt.source === 'hardware'
+      ? exposureSampleProblem(result, s.mode, measured.luma) : '';
+    if (!waitingWithReading) {
+      selectedLuma = measured.luma;
+      if (hardwareSelectionWarning) {
+        evSmooth = null;
+      } else if (!exifSource && !adjustingHardware) {
+        const smoothing = clamp(s.smoothing, 0.05, 1);
+        const alpha = nativeSource ? 1 - (1 - smoothing) ** (Math.min(elapsed, 300) / 100) : smoothing;
+        if (measured.ev === null || evSmooth === null) evSmooth = measured.ev;
+        else evSmooth += (measured.ev - evSmooth) * alpha;
+        if (nativeSource && Number.isFinite(measured.ev)) nativeLastGoodAt = now;
+        currentZoneValue = measured.zoneValue;
+      }
+    }
   }
 
+  updateExposureZones(image, measured, s);
   if (!rt.locked) {
     updateZebra(result, s);
     drawHistogram(result, s);
@@ -560,12 +795,31 @@ function onFrame(now) {
   schedule();
 }
 
-let ladderKey = '';
+function updateExposureZones(image, measured, s) {
+  if (!s.showExposureZones || !Number.isFinite(measured.luma)
+      || (lockSnapshot && !Number.isFinite(measured.ev))) {
+    dom.exposureZones.hidden = true;
+    return;
+  }
+
+  // Expose the moving scene against the held exposure, even if the preview's AE changes.
+  const displayEv = lockSnapshot?.ev ?? evSmooth;
+  const delta = Number.isFinite(measured.ev) && Number.isFinite(displayEv)
+    ? measured.ev - displayEv : 0;
+  const zones = sampleExposureZones(image, measured.luma, measured.zoneValue + delta);
+  zones.forEach((value, index) => {
+    const cell = zoneCells[index];
+    const tone = value <= 3 ? 'shadow' : value >= 7 ? 'highlight' : 'mid';
+    if (cell.dataset.tone !== tone) cell.dataset.tone = tone;
+    setText(cell, zoneRoman(value));
+  });
+  dom.exposureZones.hidden = false;
+}
 
 function updateZebra(result, s) {
   const canvas = dom.zebra;
-  canvas.hidden = !s.showZebra;
-  if (!s.showZebra || !result.clipMap) return;
+  canvas.hidden = !s.showZebra || !result.frame.clip;
+  if (canvas.hidden || !result.clipMap) return;
   const map = result.clipMap;
   if (canvas.width !== map.width || canvas.height !== map.height) {
     canvas.width = map.width;
@@ -658,60 +912,78 @@ function updateZone() {
 
   const zoneSuffix =
     shape === 'circle' || shape === 'rect' ? ' · ZONE ' + zoneRoman(s.targetZone) : '';
+  dom.zoneLabel.hidden = shape === 'full';
   setText(dom.zoneLabel, meta.tag + zoneSuffix);
   dom.zoneGrip.hidden = !positionable;
   setText(dom.tagMode, meta.tag);
   dom.zone.classList.toggle('is-locked', !!getRuntime().locked);
 }
 
-function ladderApertures(aperture) {
-  const list = APERTURES.filter((a) => a >= 1.2 && a <= 32);
-  let idx = list.findIndex((a) => Math.abs(a - aperture) < 1e-6);
-  if (idx < 0) {
-    idx = list.reduce(
-      (best, a, i) => (Math.abs(a - aperture) < Math.abs(list[best] - aperture) ? i : best),
-      0
-    );
+function initLadder() {
+  for (const aperture of APERTURES) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'ladder__item';
+    const name = document.createElement('span');
+    name.textContent = formatAperture(aperture);
+    const label = document.createElement('b');
+    label.textContent = '—';
+    button.append(name, label);
+    button.addEventListener('click', () => {
+      if (!Number.isFinite(currentEv()) || (!lockSnapshot && !stats)) {
+        toast('还没有有效读数', { type: 'warn', duration: 1800 });
+        return;
+      }
+      const s = getSettings();
+      if (lockSnapshot && s.priority === 'aperture' && s.aperture === aperture) {
+        toggleLock();
+        return;
+      }
+      if (!lockSnapshot && !toggleLock()) return;
+      updateSettings({ aperture, priority: 'aperture' });
+    });
+    dom.ladder.appendChild(button);
+    ladderItems.push({ button, aperture, label });
   }
-  const start = clamp(idx - 4, 0, Math.max(0, list.length - 9));
-  return list.slice(start, start + 9);
+  revealLadderChoice(getSettings().aperture);
 }
 
-function renderLadder(ev, s, activeAperture = s.aperture, activeShutter = null) {
-  const apertures = ladderApertures(activeAperture);
-  const key = apertures.join(',');
-  if (key !== ladderKey) {
-    ladderKey = key;
-    dom.ladder.innerHTML = '';
-    for (const a of apertures) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'ladder__item';
-      btn.dataset.aperture = String(a);
-      btn.innerHTML = `<span>f/${a}</span><b>—</b>`;
-      btn.addEventListener('click', () => {
-        updateSettings({ aperture: a, priority: 'aperture' });
-        hapticTap();
-      });
-      dom.ladder.appendChild(btn);
-    }
-  }
+function revealLadderChoice(aperture) {
+  const index = APERTURES.indexOf(aperture);
+  if (index < 0) return;
+  const { button } = ladderItems[index];
+  const { scrollLeft, clientWidth } = dom.ladder;
+  if (button.offsetLeft >= scrollLeft && button.offsetLeft + button.offsetWidth <= scrollLeft + clientWidth) return;
+  const step = ladderItems[1].button.offsetLeft - ladderItems[0].button.offsetLeft;
+  if (step <= 0 || !clientWidth) return;
+  const first = Math.max(0, index - Math.floor(clientWidth / step / 2));
+  dom.ladder.scrollLeft = ladderItems[first].button.offsetLeft;
+}
 
-  dom.ladder.querySelectorAll('.ladder__item').forEach((btn) => {
-    const a = Number(btn.dataset.aperture);
-    const isActive = Math.abs(a - activeAperture) < 1e-6;
-    const t = isActive && Number.isFinite(activeShutter)
-      ? activeShutter
-      : shutterFromEv({ ev100: ev, aperture: a, iso: s.iso, ndStops: s.ndStops });
-    const label = btn.querySelector('b');
-    if (label) label.textContent = formatShutterRecommended(t);
-    btn.classList.toggle('is-active', isActive);
-  });
+function renderLadder(pair, ev, s, source, now, locked) {
+  if (pair) lastLadderReading = { ev, source, at: now };
+  const recent = lastLadderReading && lastLadderReading.source === source
+    && now - lastLadderReading.at < LADDER_GRACE_MS;
+  const ladderEv = pair ? ev : recent ? lastLadderReading.ev : null;
+  const selected = pair?.aperture ?? s.aperture;
+  const key = [ladderEv?.toFixed(2), selected, formatShutterRecommended(pair?.shutter), s.iso, s.ndStops, !!locked, !!pair].join(':');
+  if (key === ladderRenderKey) return;
+  ladderRenderKey = key;
+  dom.ladder.classList.toggle('is-waiting', !pair);
+  for (const { button, aperture, label } of ladderItems) {
+    const active = selected === aperture;
+    const time = active && pair ? pair.shutter
+      : shutterFromEv({ ev100: ladderEv, aperture, iso: s.iso, ndStops: s.ndStops });
+    setText(label, formatShutterRecommended(time));
+    button.classList.toggle('is-active', active);
+    const pressed = String(active && !!locked);
+    if (button.getAttribute('aria-pressed') !== pressed) button.setAttribute('aria-pressed', pressed);
+  }
 }
 
 function updateReadout(force = false) {
   const now = performance.now();
-  if (!force && now - lastUi < 90) return;
+  if (!force && now - lastUi < 110) return;
   lastUi = now;
 
   const s = getSettings();
@@ -721,54 +993,78 @@ function updateReadout(force = false) {
   const data = locked ? lockSnapshot.stats : stats;
   const zoneValue = locked ? lockSnapshot.zoneValue : currentZoneValue;
 
-  if (!Number.isFinite(ev) || !data) {
+  const luma = locked ? lockSnapshot.luma : selectedLuma;
+  const pair = data ? resolvePair(s, ev) : null;
+  const relative = data && !pair;
+  const nd = s.ndStops;
+  const source = locked ? lockSnapshot.source : rt.source;
+
+  const waitingForExif = source === 'exif' && !rt.exifFailed;
+  dom.filmActions.hidden = hasNativeCamera || waitingForExif || (!!pair && source !== 'demo');
+  dom.shutter.hidden = source === 'exif';
+  renderLadder(pair, ev, s, source, now, locked);
+  setText(dom.evKey, pair ? 'EV100 估算' : '画面亮度差');
+  setText(dom.evUnit, pair ? 'EV' : '档');
+
+  if (pair) {
+    setText(dom.evValue, formatEv(ev, 1));
+  } else if (relative) {
+    const difference = log2(Math.max(luma, 1e-4) / Math.max(data.frame.mean, 1e-4));
+    setText(dom.evValue, `${difference > 0.05 ? '+' : ''}${formatEv(difference, 1)}`);
+  } else {
     setText(dom.evValue, '--.-');
-    if (rt.source === 'error') setText(dom.evSub, '相机异常');
-    else if (rt.source === 'init') setText(dom.evSub, '正在启动相机…');
-    else setText(dom.evSub, '等待画面…');
-    setText(dom.valIso, String(s.iso));
-    setText(dom.valIsoNote, s.iso === 100 ? '基础 ISO' : '手动设定');
-    setText(dom.valAperture, formatAperture(s.aperture));
-    setText(dom.valApertureNote, s.priority === 'shutter' ? '自动 · 等待读数' : '手动设定');
-    setText(dom.valShutter, '—');
-    setText(dom.valShutterNote, s.priority === 'aperture' ? '自动 · 等待读数' : '手动设定');
-    setText(dom.valNd, s.ndStops > 0 ? ndLabel(s.ndStops).replace(/\s+/g, '') : 'OFF');
-    setText(dom.valNdNote, s.ndStops > 0 ? `${ndDensity(s.ndStops)} 密度` : '无减光');
+  }
+
+  if (locked) setText(dom.evSub, '已锁定 · 点按解除');
+  else if (source === 'native' && nativeWarning) setText(dom.evSub, nativeWarning);
+  else if (pair) setText(dom.evSub, `${MODE_META[s.mode].label} · ${sourceLabel(source)}`);
+  else if (source === 'exif') setText(dom.evSub, exifSelectionWarning || rt.exifStatus || '等待新曝光样本…');
+  else if (source === 'native') setText(dom.evSub, '等待原生相机读数…');
+  else if (source === 'hardware') setText(dom.evSub, hardwareSelectionWarning || '等待硬件曝光稳定…');
+  else if (relative) setText(dom.evSub, '测光区相对画面平均');
+  else if (rt.source === 'error') setText(dom.evSub, '相机异常');
+  else setText(dom.evSub, '等待画面…');
+
+  setText(dom.metricLumLabel, pair ? '亮度估算' : '画面亮度');
+  setText(dom.metricLum, pair
+    ? formatLuminance(luminanceFromEv(ev + zoneValue - 5))
+    : relative ? `${(luma * 100).toFixed(1)}%` : '—');
+  const clip = data?.frame.clip || 0;
+  dom.metricLum.classList.toggle('is-warn', clip > 0.02);
+
+  const dr = data ? contrastStops(Math.max(data.frame.p02, 1e-5), data.frame.p98) : NaN;
+  setText(dom.metricDr, Number.isFinite(dr) ? dr.toFixed(1) + ' 档' : '—');
+
+  const cct = data ? cctFromLinearRgb(...data.frame.rgb) : NaN;
+  setText(dom.metricCct, formatCct(cct));
+  setText(dom.metricZone, pair ? 'ZONE ' + zoneRoman(zoneValue) : '—');
+
+  setText(dom.valIso, String(s.iso));
+  setText(dom.valIsoNote, '胶片 ISO');
+  setText(dom.valNd, nd > 0 ? ndLabel(nd).replace(/\s+/g, '') : 'OFF');
+  setText(dom.valNdNote, nd > 0 ? `减光 ${Number(nd.toFixed(1))} 档` : '无减光');
+
+  if (locked) {
+    setText(dom.hudHint, 'HOLD · 移动手机不会改变读数');
+  } else if (clip > 0.03) {
+    setText(dom.hudHint, `预览高光裁切 ${(clip * 100).toFixed(1)}%`);
+  } else {
+    setText(dom.hudHint, MODE_META[s.mode].hint + ' · 双指缩放');
+  }
+
+  if (!pair) {
+    const aperturePriority = s.priority === 'aperture';
+    setText(dom.valAperture, aperturePriority ? formatAperture(s.aperture) : '—');
+    setText(dom.valShutter, aperturePriority ? '—' : formatShutterRecommended(s.shutter));
+    const unavailable = waitingForExif ? '等待曝光样本' : '无曝光读数';
+    setText(dom.valApertureNote, aperturePriority ? '胶片机设定' : unavailable);
+    setText(dom.valShutterNote, aperturePriority ? unavailable : '胶片机设定');
     dom.valApertureNote.classList.remove('is-warn');
     dom.valShutterNote.classList.remove('is-warn');
     return;
   }
 
-  setText(dom.evValue, formatEv(ev, 1));
-
-  if (locked) {
-    setText(dom.evSub, '已锁定 · 点按解除后重新测光');
-  } else {
-    const base = `${MODE_META[s.mode].label} · ${sourceLabel(rt.source)}`;
-    setText(
-      dom.evSub,
-      rt.source === 'image' ? `${base} · 基准 ${s.anchorEv.toFixed(1)}` : base
-    );
-  }
-
-  setText(dom.metricLum, formatLuminance(luminanceFromEv(ev)));
-  dom.metricLum.classList.toggle('is-warn', data.frame.clip > 0.02);
-
-  const dr = contrastStops(Math.max(data.frame.p02, 1e-5), data.frame.p98);
-  setText(dom.metricDr, Number.isFinite(dr) ? dr.toFixed(1) + ' EV' : '—');
-
-  const cct = cctFromLinearRgb(data.frame.rgb[0], data.frame.rgb[1], data.frame.rgb[2]);
-  setText(dom.metricCct, formatCct(cct));
-  setText(dom.metricZone, 'ZONE ' + zoneRoman(zoneValue));
-
-  const pair = resolvePair(s, ev);
-  if (!pair) return;
-
-  const nd = s.ndStops;
   const base = pair.shutter / Math.pow(2, nd);
-
-  setText(dom.valIso, String(s.iso));
-  setText(dom.valIsoNote, s.iso === 100 ? '基础 ISO' : '手动设定');
   setText(dom.valAperture, formatAperture(pair.aperture));
   setText(dom.valShutter, formatShutterRecommended(pair.shutter));
 
@@ -785,37 +1081,26 @@ function updateReadout(force = false) {
     setText(
       dom.valShutterNote,
       nd > 0
-        ? `自动 · 基准 ${formatShutterRecommended(base)}`
+        ? `无 ND ${formatShutterRecommended(base)}`
         : `自动 · 精确 ${formatShutterExact(pair.shutter)}`
     );
   } else {
     setText(
       dom.valShutterNote,
-      nd > 0 ? `手动 · 基准 ${formatShutterRecommended(base)}` : '手动设定'
+      nd > 0 ? `无 ND ${formatShutterRecommended(base)}` : '手动设定'
     );
   }
 
   dom.valApertureNote.classList.toggle('is-warn', !!pair.apertureOutOfRange);
   dom.valShutterNote.classList.toggle('is-warn', !!pair.shutterOutOfRange);
-
-  setText(dom.valNd, nd > 0 ? ndLabel(nd).replace(/\s+/g, '') : 'OFF');
-  setText(dom.valNdNote, nd > 0 ? `${ndDensity(nd)} 密度 · ${nd.toFixed(1)} 档` : '无减光');
-
-  const clip = data.frame.clip;
-  if (locked) {
-    setText(dom.hudHint, 'HOLD · 移动手机不会改变读数');
-  } else if (clip > 0.03) {
-    setText(dom.hudHint, `高光溢出 ${(clip * 100).toFixed(1)}% · 试试高光优先或降低相机曝光`);
-  } else {
-    setText(dom.hudHint, MODE_META[s.mode].hint + ' · 双指缩放');
-  }
-
-  renderLadder(ev, s, pair.aperture, pair.shutter);
 }
 
 function syncControls() {
   const s = getSettings();
   dom.grid.hidden = !s.showGrid;
+  dom.zoneToggle.setAttribute('aria-pressed', String(s.showExposureZones));
+  dom.zoneLegend.hidden = !s.showExposureZones;
+  if (!s.showExposureZones) dom.exposureZones.hidden = true;
   dom.histogram.hidden = !s.showHistogram;
   dom.modeRow.querySelectorAll('.mode').forEach((btn) => {
     const active = btn.dataset.mode === s.mode;
@@ -837,26 +1122,41 @@ function toggleLock() {
   const rt = getRuntime();
   const next = !rt.locked;
   if (next) {
-    if (!Number.isFinite(evSmooth) || !stats) {
-      toast('还没有有效读数', { type: 'warn', duration: 1800 });
-      return;
+    const { mode } = getSettings();
+    if (!stats || (['exif', 'hardware', 'native'].includes(rt.source) && !Number.isFinite(evSmooth))
+        || (rt.source === 'native' && nativeWarning)) {
+      toast('等测光稳定后再锁定', { type: 'warn', duration: 1800 });
+      return false;
     }
-    const ex = camera && camera.isActive ? camera.getExposure() : null;
+    const ex = currentExposure();
     lockSnapshot = {
       ev: evSmooth,
       stats,
+      luma: selectedLuma,
+      source: rt.source,
       zoneValue: currentZoneValue,
-      cameraExposure:
-        ex && Number.isFinite(ex.shutter) && Number.isFinite(ex.iso)
-          ? { shutter: ex.shutter, iso: ex.iso }
-          : null
+      zone: buildRegion(mode),
+      cameraExposure: ex
     };
   } else if (lockSnapshot) {
-    evSmooth = lockSnapshot.ev;
+    if (lockSnapshot.source !== rt.source) {
+      evSmooth = null;
+      stats = null;
+    }
     lockSnapshot = null;
     lastAe = 0;
   }
   setRuntime({ locked: next });
+  syncNativePreviewRate();
+  if (rt.source === 'native' && !next) {
+    evSmooth = null;
+    nativeLastGoodAt = -Infinity;
+    syncNativeMeterPoint();
+  }
+  if (rt.source === 'exif') {
+    exifContext++;
+    if (!next) clearExifSample();
+  }
   updateStatus();
   updateZone();
   updateReadout(true);
@@ -864,6 +1164,7 @@ function toggleLock() {
   toast(next ? '已锁定读数 · 可以移动手机设置相机' : '已解除锁定 · 继续测光', {
     duration: next ? 2600 : 1600
   });
+  return true;
 }
 
 function handleZoneChange(patch) {
@@ -871,6 +1172,8 @@ function handleZoneChange(patch) {
   if (patch.cy != null) zone.cy = clamp(patch.cy, 0, 1);
   if (patch.size != null) zone.size = clamp(patch.size, 0.04, 0.94);
   updateZone();
+  updateExifReading();
+  syncNativeMeterPoint();
 }
 
 function persistZone() {
@@ -909,11 +1212,14 @@ async function capture() {
   const s = getSettings();
   const rt = getRuntime();
   const locked = rt.locked && lockSnapshot;
+  if ((locked ? lockSnapshot.source : rt.source) === 'exif') return;
   const ev = locked ? lockSnapshot.ev : evSmooth;
   const data = locked ? lockSnapshot.stats : stats;
 
-  if (!Number.isFinite(ev) || !data || !sourceEl) {
-    toast('还没有有效读数，请等待相机稳定', { type: 'warn' });
+  if (!Number.isFinite(ev) || !data || !sourceEl || (rt.source === 'native' && !locked && nativeWarning)) {
+    const message = data && !Number.isFinite(ev) && !hasNativeCamera
+      ? '请先拍照测光，再保存胶片曝光组合' : '还没有有效读数，请等待相机稳定';
+    toast(message, { type: 'warn' });
     hapticError();
     return;
   }
@@ -929,7 +1235,23 @@ async function capture() {
     const shutterWithNd = pair.shutter;
     const shutterBase = pair.shutter / Math.pow(2, nd);
     const meta = MODE_META[s.mode];
-    const loc = s.geotag ? await getLocation() : null;
+    const source = locked ? lockSnapshot.source : rt.source;
+    const calibration = source === 'native' ? s.nativeCalibration : s.calibration;
+    const aspect = stageAspect();
+    const zoom = digitalZoom;
+    const zoneValue = locked ? lockSnapshot.zoneValue : currentZoneValue;
+    const shotZone = locked ? lockSnapshot.zone : buildRegion(s.mode);
+    const cameraExposureAtTap = locked ? lockSnapshot.cameraExposure : currentExposure();
+    let frame = sourceEl;
+    let loc = null;
+    if (s.geotag && !hasNativeCamera) {
+      // Requesting location is asynchronous. Keep the image from the tap.
+      frame = document.createElement('canvas');
+      frame.width = sourceEl.videoWidth || sourceEl.width;
+      frame.height = sourceEl.videoHeight || sourceEl.height;
+      frame.getContext('2d').drawImage(sourceEl, 0, 0);
+      loc = await getLocation();
+    }
 
     const shot = {
       id: uid(),
@@ -948,18 +1270,18 @@ async function capture() {
       apertureOutOfRange: !!pair.apertureOutOfRange,
       shutterOutOfRange: !!pair.shutterOutOfRange,
       ndStops: nd,
-      luminance: luminanceFromEv(ev),
+      luminance: luminanceFromEv(ev + zoneValue - 5),
       contrast: contrastStops(Math.max(data.frame.p02, 1e-5), data.frame.p98),
       cct: cctFromLinearRgb(data.frame.rgb[0], data.frame.rgb[1], data.frame.rgb[2]),
       clip: data.frame.clip,
-      zoneValue: locked ? lockSnapshot.zoneValue : currentZoneValue,
-      zone: { shape: meta.shape, cx: zone.cx, cy: zone.cy, size: s.spotSize },
-      cameraExposure: currentExposure(),
-      source: rt.source,
-      sourceText: sourceLabel(rt.source),
+      zoneValue,
+      zone: shotZone,
+      cameraExposure: cameraExposureAtTap,
+      source,
+      sourceText: sourceLabel(source),
       zoom: s.zoom,
       lensAperture: s.lensAperture,
-      calibration: s.calibration,
+      calibration,
       location: loc,
       note: '',
       favorite: false,
@@ -967,14 +1289,14 @@ async function capture() {
       dateLabel: shortDate(now),
       coords: loc ? `${loc.lat.toFixed(4)}, ${loc.lng.toFixed(4)}` : '',
       calibrationText:
-        Math.abs(s.calibration) >= 0.05
-          ? `CAL ${s.calibration >= 0 ? '+' : ''}${s.calibration.toFixed(1)}EV`
+        Math.abs(calibration) >= 0.05
+          ? `CAL ${calibration >= 0 ? '+' : ''}${calibration.toFixed(1)}EV`
           : ''
     };
 
-    const composed = await composePhoto(sourceEl, {
-      aspect: stageAspect(),
-      digitalZoom,
+    const composed = await composePhoto(frame, {
+      aspect,
+      digitalZoom: zoom,
       shot,
       quality: s.quality
     });
@@ -1266,7 +1588,14 @@ function showEngineInfo() {
   const rt = getRuntime();
   const s = getSettings();
   const caps = rt.capabilities || {};
-  const ex = currentExposure();
+  const ex = lockSnapshot?.cameraExposure ?? currentExposure();
+  const reference = referenceReading();
+  const referenceSource = lockSnapshot?.source ?? rt.source;
+  const canCompare = Number.isFinite(reference) && ['exif', 'hardware', 'native'].includes(referenceSource);
+  const pair = resolvePair(s, currentEv());
+  const base = pair?.shutter / 2 ** s.ndStops;
+  const cameraEv = ['exif', 'native'].includes(referenceSource) && ex
+    ? evFromExposure(ex) : null;
   const exposureRange = caps.exposureTime
     ? `${formatShutterExact(caps.exposureTime.min)} – ${formatShutter(caps.exposureTime.max, {
         snap: false
@@ -1275,14 +1604,14 @@ function showEngineInfo() {
   const manualCap = Array.isArray(caps.exposureMode) && caps.exposureMode.includes('manual');
   const rows = [
     ['数据来源', sourceLabel(rt.source)],
-    ['曝光元数据', ex ? `${formatShutter(ex.shutter)} · ISO ${ex.iso}` : '未提供'],
+    ['手机曝光', ex ? `${formatShutterExact(ex.shutter)} · ISO ${Math.round(ex.iso)}` : '未提供'],
+    ['胶片快门（无 ND）', Number.isFinite(base) ? `${formatShutterRecommended(base)} · 精确 ${formatShutterExact(base)}` : '—'],
     ['手动曝光', rt.manual ? '已接管' : manualCap ? '设备支持 · 未启用' : '不支持'],
     ['相机快门范围', exposureRange],
     ['相机 ISO 范围', caps.iso ? `${Math.round(caps.iso.min)} – ${Math.round(caps.iso.max)}` : '—'],
     ['硬件变焦', rt.hardwareZoomMax > 1.02 ? `1× – ${Number(rt.hardwareZoomMax).toFixed(1)}×` : '不支持'],
-    ['换算光圈', formatAperture(s.lensAperture)],
-    ['校准偏移', `${s.calibration >= 0 ? '+' : ''}${s.calibration.toFixed(1)} EV`],
-    ['图像基准 EV', 'EV ' + s.anchorEv.toFixed(1)]
+    ['手机镜头光圈', hasNativeCamera || rt.source === 'exif' ? formatAperture(ex?.aperture) : formatAperture(s.lensAperture)],
+    ['校准偏移', `${(hasNativeCamera ? s.nativeCalibration : rt.source === 'exif' ? s.autoExifCalibration : s.calibration).toFixed(1)} EV`]
   ];
   const section = document.createElement('div');
   section.className = 'sheet-section';
@@ -1300,15 +1629,17 @@ function showEngineInfo() {
   let noteText;
   if (rt.source === 'demo') {
     noteText = '演示场景：曝光参数由程序生成，仅用于体验界面与算法。';
+  } else if (hasNativeCamera) {
+    noteText = '点测光使用主摄的测光点。平均、框选和其他区域模式通过预览亮度相对测光点估算。对照时请使用相同取景范围和测光区域。';
   } else if (rt.source === 'error') {
     noteText = '相机未运行。你仍可使用「拍照测光」读取照片 EXIF，或进入演示模式。';
+  } else if (rt.source === 'exif') {
+    noteText = rt.exifStatus || '取景时约每两秒取样一次，曝光数据在本机读取，样本照片不会保存。';
   } else if (rt.manual) {
-    noteText = '当前设备支持手动曝光：LIGHTNO 接管相机曝光，并用图像亮度反推绝对 EV。';
-  } else if (ex) {
-    noteText = '相机自动曝光参数可用：LIGHTNO 用这些参数 + 图像亮度输出绝对 EV。';
+    noteText = '手动曝光时，LIGHTNO 用相机快门、ISO 和手机镜头光圈估算 EV。';
   } else {
     noteText =
-      '浏览器未提供相机曝光参数：实时读数由图像亮度 + 图像基准 EV 决定。要绝对 EV，点画面左下角「拍照测光」读取照片 EXIF；如果设备支持手动曝光，也可在设置 → 测光引擎里切换硬件曝光。';
+      '相机预览会自动调整曝光。要计算胶片曝光，请用「拍照计算胶片曝光」读取当下场景的照片。';
   }
   note.innerHTML = noteText;
   section.appendChild(note);
@@ -1333,14 +1664,16 @@ function showEngineInfo() {
         : [
             { label: '关闭', kind: 'ghost', onClick: () => closeSheet() },
             {
-              label: '校准',
+              label: canCompare ? '对照测光表' : hasNativeCamera ? '重试相机' : rt.source === 'exif' ? '重新取样' : '拍照测光',
               kind: 'primary',
               onClick: () => {
+                if (canCompare) {
+                  openCalibration({ getLiveEv: () => reference, source: referenceSource, cameraEv });
+                  return;
+                }
                 closeSheet();
-                setTimeout(
-                  () => openCalibration({ getLiveEv: () => (lockSnapshot ? lockSnapshot.ev : evSmooth) }),
-                  60
-                );
+                if (hasNativeCamera || rt.source === 'exif') startCamera();
+                else dom.filmMeter.click();
               }
             }
           ]
@@ -1425,6 +1758,9 @@ function initInteractions() {
 
   bindDials();
 
+  dom.zoneToggle.addEventListener('click', () => {
+    updateSettings({ showExposureZones: !getSettings().showExposureZones });
+  });
   dom.shutter.addEventListener('click', capture);
   dom.retry.addEventListener('click', () => startCamera());
   dom.demoBtn.addEventListener('click', startDemo);
@@ -1435,6 +1771,13 @@ export function createMeter({ onSaved, onNavigate } = {}) {
   onSavedCb = onSaved || null;
   onNavigateCb = onNavigate || null;
 
+  initLadder();
+  for (let i = 0; i < EXPOSURE_ZONE_GRID ** 2; i++) {
+    const cell = document.createElement('span');
+    cell.className = 'exposure-zones__cell';
+    dom.exposureZones.appendChild(cell);
+    zoneCells.push(cell);
+  }
   initInteractions();
   syncControls();
   updateStatus();
@@ -1449,6 +1792,10 @@ export function createMeter({ onSaved, onNavigate } = {}) {
       if (Math.abs(s.zone.cy - zone.cy) > 1e-4) zone.cy = s.zone.cy;
     }
     syncControls();
+    if (event.patch.aperture != null) revealLadderChoice(s.aperture);
+    if (event.patch.fps != null || event.patch.mode != null) syncNativePreviewRate();
+    updateExifReading();
+    syncNativeMeterPoint();
     updateReadout(true);
     syncWakeLock();
   });
@@ -1460,6 +1807,12 @@ export function createMeter({ onSaved, onNavigate } = {}) {
   }
 
   const onVisible = () => {
+    if (document.visibilityState === 'hidden' && (hasNativeCamera || getRuntime().source === 'exif')) {
+      stopCamera();
+      stats = null;
+      setRuntime({ exifStatus: '返回取景后重新取样' });
+      updateReadout(true);
+    }
     if (document.visibilityState === 'visible' && running && sourceEl && rafId == null) {
       lastSample = 0;
       schedule();
@@ -1485,7 +1838,8 @@ export function createMeter({ onSaved, onNavigate } = {}) {
       syncWakeLock();
     },
     getLiveEv() {
-      return currentEv();
+      const source = lockSnapshot?.source ?? getRuntime().source;
+      return ['hardware', 'native'].includes(source) ? referenceReading() : null;
     },
     startDemo,
     retryCamera: startCamera,
@@ -1497,7 +1851,8 @@ export function createMeter({ onSaved, onNavigate } = {}) {
       if (ro) ro.disconnect();
       document.removeEventListener('visibilitychange', onVisible);
       if (gestureCtl) gestureCtl.destroy();
-      setWakeLock(false);
+      if (hasNativeCamera) setNativeKeepAwake(false);
+      else setWakeLock(false);
     }
   };
 }

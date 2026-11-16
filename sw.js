@@ -4,7 +4,7 @@
  *
  * 修改任何前端文件后，请把 VERSION 加一，确保用户拿到新版本。
  */
-const VERSION = 'lightno-v1.1.0';
+const VERSION = 'lightno-v1.1.6';
 
 const PRECACHE = [
   './',
@@ -19,8 +19,11 @@ const PRECACHE = [
   './js/core/exposure.js',
   './js/core/sampler.js',
   './js/core/camera.js',
+  './js/core/nativeCamera.js',
+  './js/core/nativeExposure.js',
   './js/core/capture.js',
   './js/core/exif.js',
+  './js/core/previewExif.js',
   './js/core/store.js',
   './js/core/demo.js',
   './js/core/wake.js',

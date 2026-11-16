@@ -1,9 +1,9 @@
 /**
- * LIGHTNO · 拍照测光（iPhone 可用的绝对 EV 路径）
+ * LIGHTNO · 用原片估算胶片曝光
  *
  * 用系统相机拍一张照片 → 读取 JPEG EXIF 的快门/光圈/ISO →
  * 结合照片区域的图像亮度反推该区域的 EV。
- * 不依赖 getUserMedia 的曝光控制，也没有硬件限制。
+ * 使用拍摄时的固定光圈和曝光数据。
  */
 import { $, setText, uid, timeLabel, shortDate } from './dom.js';
 import { openSheet, closeSheet } from './sheet.js';
@@ -24,11 +24,12 @@ import {
   formatShutterRecommended,
   formatAperture,
   formatEv,
-  formatLuminance,
   luminanceFromEv,
-  formatCct,
   cctFromLinearRgb,
-  contrastStops
+  contrastStops,
+  ISOS,
+  APERTURES,
+  SHUTTERS
 } from '../core/exposure.js';
 
 const ANALYSIS_MAX = 900;
@@ -36,28 +37,24 @@ const DISPLAY_W = 360;
 const DISPLAY_H = 300;
 
 let inputEl = null;
+let cameraInput = null;
 let onSavedCb = null;
-let state = null;
 
 export function createPhotoMeter({ onSaved } = {}) {
   onSavedCb = onSaved || null;
   inputEl = $('#photoInput');
-  const btn = $('#btnPhotoMeter');
-  if (btn && inputEl) {
-    btn.addEventListener('click', () => inputEl.click());
-  }
-  if (inputEl) {
-    inputEl.addEventListener('change', async () => {
-      const file = inputEl.files && inputEl.files[0];
-      inputEl.value = '';
+  cameraInput = $('#cameraPhotoInput');
+  $('#btnPhotoMeter').addEventListener('click', () => cameraInput.click());
+  $('#btnFilmMeter').addEventListener('click', () => cameraInput.click());
+  $('#btnImportMeter').addEventListener('click', () => inputEl.click());
+
+  for (const input of [inputEl, cameraInput]) {
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      input.value = '';
       if (file) await openFile(file);
     });
   }
-  return {
-    open() {
-      if (inputEl) inputEl.click();
-    }
-  };
 }
 
 function isHeic(file, buffer) {
@@ -72,7 +69,7 @@ function isHeic(file, buffer) {
 }
 
 async function openFile(file) {
-  if (!file.type || !file.type.startsWith('image/')) {
+  if (file.type && !file.type.startsWith('image/')) {
     toast('请选择照片文件', { type: 'warn' });
     return;
   }
@@ -91,7 +88,7 @@ async function openFile(file) {
     const heic = isHeic(file, buffer);
     openSheet({
       title: '这张照片没有曝光信息',
-      subtitle: '无法从 EXIF 读取快门 / 光圈 / ISO，因此不能计算绝对 EV',
+      subtitle: '无法从 EXIF 读取快门 / 光圈 / ISO，因此无法估算这次胶片曝光',
       content: `<div class="doc">
         <p>请用 <b>系统相机</b> 拍摄照片（不要用截图、聊天软件转存的图片，它们通常会清除 EXIF）。</p>
         <h4>iPhone 设置</h4>
@@ -103,13 +100,13 @@ async function openFile(file) {
         }</p>
       </div>`,
       actions: [
-        { label: '关闭', kind: 'ghost', onClick: () => closeSheet() },
+        { label: '选择 JPEG 原片', kind: 'ghost', onClick: () => inputEl.click() },
         {
           label: '重新拍摄',
           kind: 'primary',
           onClick: () => {
             closeSheet();
-            if (inputEl) inputEl.click();
+            cameraInput.click();
           }
         }
       ]
@@ -161,7 +158,7 @@ async function openFile(file) {
     return;
   }
 
-  state = {
+  const photo = {
     file,
     img,
     url,
@@ -176,13 +173,12 @@ async function openFile(file) {
     },
     stats: null,
     ev: null,
-    avgEv: null,
     saveBusy: false,
     raf: 0,
     dragging: false
   };
 
-  showPhotoSheet(state);
+  showPhotoSheet(photo);
 }
 
 function showPhotoSheet(current) {
@@ -193,35 +189,63 @@ function showPhotoSheet(current) {
       <canvas id="photoCanvas" class="photo-canvas"></canvas>
       <span class="photo-stage__hint">拖动选择测光区</span>
     </div>
-    <div class="photo-readout">
-      <div class="photo-ev">
-        <span>EV 100</span>
-        <b id="photoEv">—</b>
-        <i id="photoEvNote">中心测光区</i>
-      </div>
-      <div class="photo-params">
-        <span id="photoExif">照片 —</span>
-        <span id="photoCameraEv">相机 EV —</span>
-        <span id="photoAvgEv">平均 EV —</span>
-        <span id="photoCct">色温 —</span>
-      </div>
+    <div class="photo-result">
+      <span>胶片曝光建议</span>
+      <b id="photoPair">—</b>
+      <p class="picker-note" id="photoNote"></p>
     </div>
-    <p class="picker-note">
-      EV 由照片 EXIF 的快门 / 光圈 / ISO 与所选区域的图像亮度反推。拖动照片上的圆圈可以改变测光区。
-    </p>
-    <button class="btn btn--ghost photo-anchor" id="photoUseAnchor" type="button">
-      将平均 EV 设为实时图像基准
-    </button>
+    <div class="photo-exposure-controls">
+      <label>胶片 ISO <select id="filmIso"></select></label>
+      <label>曝光方式
+        <select id="filmPriority">
+          <option value="aperture">固定光圈</option>
+          <option value="shutter">固定快门</option>
+        </select>
+      </label>
+      <label>固定光圈 <select id="filmAperture"></select></label>
+      <label>固定快门 <select id="filmShutter"></select></label>
+    </div>
+    <p class="picker-note" id="photoExif"></p>
+    <details>
+      <summary>用参考测光表校准</summary>
+      <p class="picker-note">把圆框对准同一光线下的灰卡，输入参考测光表对灰卡测得的 EV100。</p>
+      <div class="field">
+        <label for="photoReference">参考 EV100</label>
+        <input id="photoReference" type="number" inputmode="decimal" step="any" />
+      </div>
+      <button class="btn btn--ghost" id="photoCalibrate" type="button">应用校准</button>
+      <button class="btn btn--ghost" id="photoResetCalibration" type="button">清除偏移</button>
+    </details>
   `;
 
   const canvas = content.querySelector('#photoCanvas');
-  const evEl = content.querySelector('#photoEv');
-  const noteEl = content.querySelector('#photoEvNote');
+  const pairEl = content.querySelector('#photoPair');
+  const noteEl = content.querySelector('#photoNote');
   const exifEl = content.querySelector('#photoExif');
-  const cameraEvEl = content.querySelector('#photoCameraEv');
-  const avgEvEl = content.querySelector('#photoAvgEv');
-  const cctEl = content.querySelector('#photoCct');
-  const anchorBtn = content.querySelector('#photoUseAnchor');
+  const refInput = content.querySelector('#photoReference');
+
+  const prioritySelect = content.querySelector('#filmPriority');
+  prioritySelect.value = getSettings().priority;
+  prioritySelect.addEventListener('change', () => {
+    updateSettings({ priority: prioritySelect.value });
+    render();
+  });
+
+  const filmControls = [
+    [content.querySelector('#filmIso'), 'iso', ISOS, String],
+    [content.querySelector('#filmAperture'), 'aperture', APERTURES, formatAperture],
+    [content.querySelector('#filmShutter'), 'shutter', SHUTTERS, formatShutterRecommended]
+  ];
+  for (const [select, key, values, format] of filmControls) {
+    const initial = getSettings()[key];
+    const options = [...new Set([...values, initial])].sort((a, b) => a - b);
+    for (const value of options) select.add(new Option(format(value), value));
+    select.value = String(initial);
+    select.addEventListener('change', () => {
+      updateSettings({ [key]: Number(select.value) });
+      render();
+    });
+  }
 
   const imgW = current.analysis.width;
   const imgH = current.analysis.height;
@@ -242,14 +266,15 @@ function showPhotoSheet(current) {
       size: region.size,
       feather: 0.1
     });
-    const y = clamp(stats.region.mean, 1e-4, 1);
-    const calibration = getSettings().calibration;
-    const ev = current.cameraEv + log2(y / MID_GRAY) + calibration;
-    const avgEv =
-      current.cameraEv + log2(clamp(stats.frame.mean, 1e-4, 1) / MID_GRAY) + calibration;
+    const settings = getSettings();
+    for (const [select, key] of filmControls) {
+      select.parentElement.hidden = key !== 'iso' && key !== settings.priority;
+    }
+    const clipped = stats.region.clip > 0.05;
+    const tooDark = stats.region.p98 < 0.005;
+    current.ev = clipped || tooDark ? null
+      : current.cameraEv + log2(stats.region.mean / MID_GRAY) + settings.photoCalibration;
     current.stats = stats;
-    current.ev = ev;
-    current.avgEv = avgEv;
 
     ctx.clearRect(0, 0, dw, dh);
     ctx.drawImage(current.analysis, 0, 0, dw, dh);
@@ -276,32 +301,26 @@ function showPhotoSheet(current) {
     ctx.stroke();
     ctx.restore();
 
-    setText(evEl, formatEv(ev, 1));
-    setText(noteEl, `点测光 · ${formatLuminance(luminanceFromEv(ev))}`);
-    setText(
-      exifEl,
-      `照片 ${formatShutter(current.exif.exposureTime)} · ${formatAperture(
-        current.exif.fNumber
-      )} · ISO ${current.exif.iso}`
-    );
-    setText(cameraEvEl, `相机 EV ${formatEv(current.cameraEv, 1)}`);
-    const dr = contrastStops(Math.max(stats.frame.p02, 1e-5), stats.frame.p98);
-    setText(
-      avgEvEl,
-      `平均 EV ${formatEv(avgEv, 1)} · 反差 ${Number.isFinite(dr) ? dr.toFixed(1) : '—'} EV`
-    );
-    setText(
-      cctEl,
-      `色温 ${formatCct(
-        cctFromLinearRgb(stats.region.rgb[0], stats.region.rgb[1], stats.region.rgb[2])
-      )}`
-    );
-    if (anchorBtn) {
-      if (!anchorBtn.disabled) {
-        anchorBtn.textContent = `将平均 EV ${formatEv(avgEv, 1)} 设为实时图像基准`;
-      }
+    const pair = filmPair(settings);
+    if (pair) {
+      setText(pairEl, `ISO ${settings.iso} · ${formatAperture(pair.aperture)} · ${formatShutterRecommended(pair.shutter)}${settings.ndStops ? ` · ND ${settings.ndStops} 档` : ''}`);
+      const priority = settings.priority === 'aperture' ? '光圈优先' : '快门优先';
+      const range = pair.apertureOutOfRange ? '所需光圈超出范围'
+        : pair.shutterOutOfRange ? '所需快门超出范围' : priority + ' · 选区按中灰';
+      setText(noteEl, `估算 EV100 ${formatEv(current.ev, 1)} · ${range}`);
+    } else {
+      setText(pairEl, '—');
+      setText(noteEl, clipped ? '测光区域高光裁切，请换区域或重拍' : '测光区域太暗，请换区域或重拍');
     }
+    const { exposureTime, fNumber, iso } = current.exif;
+    const offset = settings.photoCalibration;
+    setText(exifEl, `原片 ${formatShutter(exposureTime, { snap: false })} · ${formatAperture(fNumber)} · ISO ${iso} · 校准 ${offset >= 0 ? '+' : ''}${offset.toFixed(1)} EV`);
   };
+
+  function filmPair(settings) {
+    if (!Number.isFinite(current.ev)) return null;
+    return exposurePair({ ...settings, ev100: current.ev });
+  }
 
   const scheduleRender = () => {
     if (current.raf) return;
@@ -338,20 +357,17 @@ function showPhotoSheet(current) {
   canvas.addEventListener('pointercancel', endDrag);
 
 async function save() {
-    if (!Number.isFinite(current.ev) || current.saveBusy) return;
+    if (current.saveBusy) return;
+    render();
+    const s = getSettings();
+    const pair = filmPair(s);
+    if (!pair) {
+      toast('请选择能测光的区域再保存', { type: 'warn' });
+      return;
+    }
+
     current.saveBusy = true;
     try {
-      const s = getSettings();
-      const pair = exposurePair({
-        ev100: current.ev,
-        iso: s.iso,
-        ndStops: s.ndStops,
-        priority: s.priority,
-        aperture: s.aperture,
-        shutter: s.shutter
-      });
-      if (!pair) throw new Error('曝光组合计算失败');
-
       const nd = s.ndStops;
       const now = Date.now();
       const stats = current.stats;
@@ -398,7 +414,7 @@ async function save() {
         sourceText: '拍照测光 EXIF',
         zoom: 1,
         lensAperture: s.lensAperture,
-        calibration: s.calibration,
+        calibration: s.photoCalibration,
         location: null,
         note: '',
         favorite: false,
@@ -406,8 +422,8 @@ async function save() {
         dateLabel: shortDate(now),
         coords: '',
         calibrationText:
-          Math.abs(s.calibration) >= 0.05
-            ? `CAL ${s.calibration >= 0 ? '+' : ''}${s.calibration.toFixed(1)}EV`
+          Math.abs(s.photoCalibration) >= 0.05
+            ? `CAL ${s.photoCalibration >= 0 ? '+' : ''}${s.photoCalibration.toFixed(1)}EV`
             : '',
         photoMeta: {
           make: exif.make || '',
@@ -445,23 +461,33 @@ async function save() {
     }
   }
 
-  anchorBtn.addEventListener('click', () => {
-    if (!Number.isFinite(current.avgEv)) return;
-    // 实时图像公式会再加一次校准，这里存「未校准的场景平均 EV」，避免重复
-    updateSettings({ anchorEv: current.avgEv - getSettings().calibration });
-    toast(`实时图像基准已设为 EV ${formatEv(current.avgEv, 1)}`, {
-      type: 'success',
-      duration: 2600
-    });
-    anchorBtn.textContent = '已设为实时图像基准';
-    anchorBtn.disabled = true;
+  content.querySelector('#photoCalibrate').addEventListener('click', () => {
+    render();
+    const ref = refInput.valueAsNumber;
+    if (!Number.isFinite(ref) || !Number.isFinite(current.ev)) {
+      toast('请选择灰卡区域并输入参考 EV100', { type: 'warn' });
+      return;
+    }
+    const offset = getSettings().photoCalibration + ref - current.ev;
+    if (Math.abs(offset) > 6) {
+      toast('偏差超过 6 档，请核对灰卡区域和参考读数', { type: 'warn' });
+      return;
+    }
+    updateSettings({ photoCalibration: offset });
+    render();
+    toast('已应用拍照测光校准', { type: 'success' });
+  });
+
+  content.querySelector('#photoResetCalibration').addEventListener('click', () => {
+    updateSettings({ photoCalibration: 0 });
+    render();
   });
 
   render();
 
   openSheet({
-    title: '拍照测光',
-    subtitle: '读取照片 EXIF 的曝光参数，再结合图像亮度分析',
+    title: '胶片拍照测光',
+    subtitle: '用同一光线下的新拍原片。关闭闪光，优先选择均匀的中间调。',
     content,
     actions: [
       {
@@ -469,7 +495,7 @@ async function save() {
         kind: 'ghost',
         onClick: () => {
           closeSheet();
-          if (inputEl) inputEl.click();
+          cameraInput.click();
         }
       },
       { label: '保存到记录', kind: 'primary', onClick: save }
@@ -477,7 +503,6 @@ async function save() {
     onClose: () => {
       if (current.raf) cancelAnimationFrame(current.raf);
       if (current.url) URL.revokeObjectURL(current.url);
-      state = null;
     }
   });
 }

@@ -3,7 +3,8 @@
  * 覆盖曝光换算、ND、格式化和纯函数测光统计。
  */
 import * as X from '../js/core/exposure.js';
-import { analyze } from '../js/core/sampler.js';
+import { estimateNativeExposure } from '../js/core/nativeExposure.js';
+import { analyze, sampleExposureZones, SRGB_TO_LINEAR } from '../js/core/sampler.js';
 
 let passed = 0;
 const failures = [];
@@ -132,6 +133,17 @@ test('推荐快门显示：极快快门不强行取整', () => {
   nearStr(X.formatShutterRecommended(600), '10min');
 });
 
+test('原生点测光使用相机曝光，平均和框选采用相对亮度', () => {
+  const exposure = { aperture: 4, iso: 800, shutter: 1 / 640, offset: 0, pointSupported: true };
+  const sample = { exposure, luma: 0.10, anchor: { mean: 0.20, clip: 0 }, zoneValue: 5, calibration: 0 };
+  const spot = estimateNativeExposure({ ...sample, mode: 'spot' }).ev;
+  eq(spot, 10.321928094887362);
+  eq(estimateNativeExposure({ ...sample, mode: 'average' }).ev, spot - 1);
+  eq(estimateNativeExposure({ ...sample, mode: 'area', zoneValue: 6 }).ev, spot - 2);
+  ok(estimateNativeExposure({ ...sample, mode: 'average', anchor: { mean: 0.2, clip: 0.2 } }).ev === null);
+  ok(estimateNativeExposure({ ...sample, mode: 'spot', exposure: { ...exposure, adjusting: true } }).settling);
+});
+
 console.log('\nMetering statistics');
 
 /** 生成一张 64x64 的灰度 RGBA 画面：左半 18% 灰，右半纯白 */
@@ -171,6 +183,24 @@ test('矩形框选统计正确', () => {
   const { data, width, height } = syntheticFrame();
   const res = analyze(data, width, height, { shape: 'rect', cx: 0.75, cy: 0.5, size: 0.2 });
   ok(res.region.mean > 0.9, 'rect mean=' + res.region.mean);
+});
+
+test('分区曝光：以测光区为基准，并保持影调之间的档差', () => {
+  const width = 16;
+  const height = 16;
+  const data = new Uint8ClampedArray(width * height * 4);
+  const tones = [32, 128, 192, 255];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      const gray = tones[Math.floor(x / 4)];
+      data.set([gray, gray, gray, 255], i);
+    }
+  }
+  const frame = { data, width, height };
+  const neutral = SRGB_TO_LINEAR[128];
+  nearStr([...sampleExposureZones(frame, neutral, 5)].join(','), '1,5,6,7,'.repeat(4).slice(0, -1));
+  nearStr([...sampleExposureZones(frame, neutral, 4)].join(','), '0,4,5,6,'.repeat(4).slice(0, -1));
 });
 
 console.log('\n' + (failures.length ? 'FAILED' : 'All tests passed') + ` — ${passed} passed, ${failures.length} failed\n`);

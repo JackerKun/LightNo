@@ -83,6 +83,7 @@ export function attachStageGestures(stage, opts) {
 
   function onPointerDown(event) {
     if (event.button != null && event.button !== 0) return;
+    if (event.target.closest?.('button, input, a, .zoom')) return;
     if (!rect) geometry();
     pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     try {
@@ -116,11 +117,7 @@ export function attachStageGestures(stage, opts) {
     if (isPositionable()) {
       if (zoneEl && zoneEl.contains(event.target)) {
         mode = 'drag';
-      } else if (
-        !event.target.closest('.zoom') &&
-        !event.target.closest('.shutter') &&
-        !event.target.closest('.stage-photo')
-      ) {
+      } else {
         // 点按空白处：立即把测光框移动过去后继续拖动
         applyCenter(event.clientX - rect.left, event.clientY - rect.top);
         mode = 'drag';
